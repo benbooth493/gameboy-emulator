@@ -7,6 +7,7 @@ use gb_core::disasm::disassemble;
 use gb_core::{Button, Cartridge, GameBoy, SCREEN_H, SCREEN_W};
 
 use crate::audio::Audio;
+use crate::pacing::{Clock, Pacer, GB_FPS};
 use crate::screen::{ScreenCallback, ScreenRenderer};
 
 pub struct EmulatorApp {
@@ -24,13 +25,10 @@ pub struct EmulatorApp {
     follow_pc: bool,
     disasm_base: u16,
     last_update: Option<std::time::Instant>,
-    frame_accum: f64,
+    pacer: Pacer,
     /// Pending result from the async ROM-picker dialog.
     rom_rx: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
 }
-
-/// DMG frame rate: 4194304 Hz / 70224 cycles per frame.
-const GB_FPS: f64 = 4_194_304.0 / 70_224.0;
 
 impl EmulatorApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rom_path: Option<String>) -> Self {
@@ -49,9 +47,11 @@ impl EmulatorApp {
             ));
 
         let audio = Audio::new();
+        let pacer = Pacer::new(audio.sample_rate);
         let mut app = EmulatorApp {
             gb: None,
             audio,
+            pacer,
             prev_frame: vec![0; SCREEN_W * SCREEN_H],
             cur_frame: vec![0; SCREEN_W * SCREEN_H],
             show_debugger: true,
@@ -64,7 +64,6 @@ impl EmulatorApp {
             follow_pc: true,
             disasm_base: 0x0100,
             last_update: None,
-            frame_accum: 0.0,
             rom_rx: None,
         };
         if let Some(path) = rom_path {
@@ -135,54 +134,41 @@ impl EmulatorApp {
         let Some(gb) = self.gb.as_mut() else { return };
         if gb.debugger.paused {
             self.last_update = None;
+            self.pacer.reset();
             // Keep the debugger view of the framebuffer fresh while stepping.
             self.cur_frame.copy_from_slice(gb.framebuffer());
             return;
         }
 
-        if self.audio.available {
-            // Audio-clocked pacing: the sound card consumes the queue at
-            // exactly the real-time sample rate, so we simply top the queue
-            // up to a target depth each repaint. This keeps the game running
-            // at true speed AND never drops or gaps samples — important in a
-            // stage, where all four channels are active and any dropped chunk
-            // is audible as broken music.
-            let sr = self.audio.sample_rate as usize;
-            let target_frames = sr * 60 / 1000; // ~60 ms of headroom
-            // Safety cap so a stall can't spin the emulator forever.
-            let max_frames = 8;
-            let mut ran = 0;
-            while self.audio.queued_frames() < target_frames && ran < max_frames {
-                if let Some(stop) = gb.run_frame() {
-                    self.status = format!("Stopped: {stop:?}");
-                    break;
-                }
-                self.audio.push_samples(&gb.bus.apu.drain_samples());
-                self.prev_frame.copy_from_slice(&self.cur_frame);
-                self.cur_frame.copy_from_slice(gb.framebuffer());
-                ran += 1;
-            }
+        // Read the clock and let the pacer decide how many frames to run. When
+        // a sound device is open it is the clock — topping the queue up to a
+        // target depth keeps true speed and never drops or gaps samples (a
+        // dropped chunk is audible as broken music in a stage). Otherwise we
+        // fall back to wall-clock time.
+        let frames = if self.audio.available {
+            self.pacer
+                .frames_due(Clock::Audio { queued_frames: self.audio.queued_frames() })
         } else {
-            // No audio device: fall back to wall-clock pacing.
             let now = std::time::Instant::now();
-            let dt = self
+            let elapsed = self
                 .last_update
-                .map(|t| (now - t).as_secs_f64())
-                .unwrap_or(1.0 / GB_FPS)
-                .min(0.1);
+                .map(|t| now - t)
+                .unwrap_or_else(|| std::time::Duration::from_secs_f64(1.0 / GB_FPS));
             self.last_update = Some(now);
-            self.frame_accum += dt * GB_FPS;
-            let frames = (self.frame_accum as u32).min(4);
-            self.frame_accum -= frames as f64;
-            for _ in 0..frames {
-                if let Some(stop) = gb.run_frame() {
-                    self.status = format!("Stopped: {stop:?}");
-                    break;
-                }
-                gb.bus.apu.drain_samples();
-                self.prev_frame.copy_from_slice(&self.cur_frame);
-                self.cur_frame.copy_from_slice(gb.framebuffer());
+            self.pacer.frames_due(Clock::Wall { elapsed })
+        };
+
+        for _ in 0..frames {
+            if let Some(stop) = gb.run_frame() {
+                self.status = format!("Stopped: {stop:?}");
+                break;
             }
+            let samples = gb.bus.apu.drain_samples();
+            if self.audio.available {
+                self.audio.push_samples(&samples);
+            }
+            self.prev_frame.copy_from_slice(&self.cur_frame);
+            self.cur_frame.copy_from_slice(gb.framebuffer());
         }
     }
 

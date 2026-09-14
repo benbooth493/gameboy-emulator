@@ -1,32 +1,52 @@
-//! Debugger core: breakpoints, watchpoints, stepping and execution trace.
+//! Debugger state: breakpoints, pause flag, and the execution trace.
+//!
+//! This module owns the *state* the run-control verbs act on; the verbs
+//! themselves ([`GameBoy::pause`](crate::GameBoy::pause),
+//! [`step_frame`](crate::GameBoy::step_frame), etc.) live on the machine that
+//! drives them. Fields are private so callers go through the verbs, not the
+//! data.
 
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     Breakpoint(u16),
-    Watchpoint { addr: u16, value: u8 },
     Step,
     Paused,
 }
 
-#[derive(Default)]
 pub struct Debugger {
-    pub breakpoints: HashSet<u16>,
-    pub watchpoints: HashSet<u16>,
-    pub paused: bool,
+    breakpoints: HashSet<u16>,
+    paused: bool,
     /// Ring buffer of recently executed PCs.
     trace: Vec<u16>,
     trace_pos: usize,
-    pub trace_capacity: usize,
+    trace_capacity: usize,
+}
+
+impl Default for Debugger {
+    fn default() -> Self {
+        Debugger {
+            breakpoints: HashSet::new(),
+            paused: false,
+            trace: Vec::new(),
+            trace_pos: 0,
+            trace_capacity: 256,
+        }
+    }
 }
 
 impl Debugger {
     pub fn new() -> Self {
-        Debugger {
-            trace_capacity: 256,
-            ..Default::default()
-        }
+        Debugger::default()
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        self.paused = paused;
     }
 
     pub fn toggle_breakpoint(&mut self, addr: u16) {
@@ -37,6 +57,13 @@ impl Debugger {
 
     pub fn has_breakpoint(&self, addr: u16) -> bool {
         self.breakpoints.contains(&addr)
+    }
+
+    /// Breakpoint addresses, ascending.
+    pub fn breakpoints(&self) -> Vec<u16> {
+        let mut v: Vec<u16> = self.breakpoints.iter().copied().collect();
+        v.sort_unstable();
+        v
     }
 
     pub fn record_pc(&mut self, pc: u16) {
@@ -62,6 +89,11 @@ impl Debugger {
             v
         }
     }
+
+    #[cfg(test)]
+    fn set_trace_capacity(&mut self, cap: usize) {
+        self.trace_capacity = cap;
+    }
 }
 
 #[cfg(test)]
@@ -78,9 +110,18 @@ mod tests {
     }
 
     #[test]
+    fn breakpoints_listed_sorted() {
+        let mut d = Debugger::new();
+        d.toggle_breakpoint(0x0200);
+        d.toggle_breakpoint(0x0100);
+        d.toggle_breakpoint(0x0150);
+        assert_eq!(d.breakpoints(), vec![0x0100, 0x0150, 0x0200]);
+    }
+
+    #[test]
     fn trace_ring_buffer() {
         let mut d = Debugger::new();
-        d.trace_capacity = 4;
+        d.set_trace_capacity(4);
         for pc in 0..6u16 {
             d.record_pc(pc);
         }

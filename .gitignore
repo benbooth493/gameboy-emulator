@@ -1,0 +1,4 @@
+/target
+test-roms/*.gb
+*.sav
+.serena/

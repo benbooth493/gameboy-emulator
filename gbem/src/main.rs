@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod pacing;
+mod saves;
 mod screen;
 
 fn main() -> eframe::Result<()> {

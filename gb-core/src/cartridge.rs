@@ -18,6 +18,9 @@ pub struct Cartridge {
     ram_bank: usize,
     ram_enabled: bool,
     banking_mode: u8, // MBC1 mode
+    /// Set whenever cartridge RAM is written; the host clears it after
+    /// persisting the RAM to a save file.
+    ram_dirty: bool,
 }
 
 #[derive(Debug)]
@@ -69,6 +72,7 @@ impl Cartridge {
             ram_bank: 0,
             ram_enabled: false,
             banking_mode: 0,
+            ram_dirty: false,
         })
     }
 
@@ -113,6 +117,7 @@ impl Cartridge {
                     if !self.ram.is_empty() {
                         let idx = (addr as usize - 0xA000) % self.ram.len();
                         self.ram[idx] = val;
+                        self.ram_dirty = true;
                     }
                 }
             }
@@ -162,15 +167,36 @@ impl Cartridge {
         let idx = self.ram_bank * 0x2000 + (addr as usize - 0xA000);
         if idx < self.ram.len() {
             self.ram[idx] = val;
+            self.ram_dirty = true;
         }
     }
 
-    /// Battery-backed RAM contents (for save files).
+    /// Whether this cartridge has battery-backed RAM worth persisting.
     pub fn has_battery(&self) -> bool {
         matches!(
             self.rom.get(0x147).copied().unwrap_or(0),
             0x03 | 0x09 | 0x0F | 0x10 | 0x13 | 0x1B | 0x1E
         )
+    }
+
+    /// The battery-backed RAM, for writing to a save file.
+    pub fn ram(&self) -> &[u8] {
+        &self.ram
+    }
+
+    /// Restore battery-backed RAM from a save file. Ignored unless the sizes
+    /// match, so a stale or foreign save can't corrupt state.
+    pub fn load_ram(&mut self, data: &[u8]) {
+        if data.len() == self.ram.len() {
+            self.ram.copy_from_slice(data);
+            self.ram_dirty = false;
+        }
+    }
+
+    /// Return whether RAM changed since the last call, clearing the flag.
+    /// The host uses this to decide when to flush a save file.
+    pub fn take_ram_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.ram_dirty)
     }
 }
 
@@ -192,6 +218,47 @@ mod tests {
     #[test]
     fn rejects_tiny_rom() {
         assert!(Cartridge::from_rom(vec![0; 16]).is_err());
+    }
+
+    #[test]
+    fn has_battery_detects_battery_types() {
+        // 0x03 = MBC1+RAM+BATTERY; 0x01 = MBC1 (no battery).
+        assert!(Cartridge::from_rom(rom(0x03, 0x02, 2)).unwrap().has_battery());
+        assert!(!Cartridge::from_rom(rom(0x01, 0x02, 2)).unwrap().has_battery());
+    }
+
+    #[test]
+    fn ram_writes_set_dirty_flag() {
+        let mut c = Cartridge::from_rom(rom(0x03, 0x02, 2)).unwrap();
+        assert!(!c.take_ram_dirty());
+        c.write(0x0000, 0x0A); // enable RAM
+        c.write(0xA000, 0x42);
+        assert!(c.take_ram_dirty());
+        assert!(!c.take_ram_dirty(), "flag cleared after being taken");
+    }
+
+    #[test]
+    fn save_and_restore_ram_roundtrips() {
+        let mut c = Cartridge::from_rom(rom(0x03, 0x02, 2)).unwrap();
+        c.write(0x0000, 0x0A);
+        c.write(0xA000, 0xAB);
+        c.write(0xA001, 0xCD);
+        let saved = c.ram().to_vec();
+
+        let mut fresh = Cartridge::from_rom(rom(0x03, 0x02, 2)).unwrap();
+        fresh.load_ram(&saved);
+        fresh.write(0x0000, 0x0A); // enable to read back
+        assert_eq!(fresh.read(0xA000), 0xAB);
+        assert_eq!(fresh.read(0xA001), 0xCD);
+        assert!(!fresh.take_ram_dirty(), "loading a save is not a dirtying write");
+    }
+
+    #[test]
+    fn load_ram_ignores_size_mismatch() {
+        let mut c = Cartridge::from_rom(rom(0x03, 0x02, 2)).unwrap(); // 8 KiB RAM
+        c.load_ram(&[0xFF; 4]); // wrong size: ignored
+        c.write(0x0000, 0x0A);
+        assert_eq!(c.read(0xA000), 0x00);
     }
 
     #[test]

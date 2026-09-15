@@ -38,6 +38,8 @@ pub struct EmulatorApp {
     unsaved_ram: bool,
     /// When the most recent battery-RAM write happened (for debounced saving).
     last_ram_change: Option<std::time::Instant>,
+    /// Set by the debugger panel's "Save now" button; handled after the panel.
+    save_requested: bool,
     /// Pending result from the async ROM-picker dialog.
     rom_rx: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
 }
@@ -79,6 +81,7 @@ impl EmulatorApp {
             save_path: None,
             unsaved_ram: false,
             last_ram_change: None,
+            save_requested: false,
             rom_rx: None,
         };
         if let Some(path) = rom_path {
@@ -157,6 +160,23 @@ impl EmulatorApp {
         let result = saves::write(&path, gb.bus.cart.ram());
         match result {
             Ok(()) => self.unsaved_ram = false,
+            Err(e) => self.status = format!("Save failed: {e}"),
+        }
+    }
+
+    /// Explicit "Save now": write battery RAM even if nothing changed.
+    fn save_now(&mut self) {
+        let Some(path) = self.save_path.clone() else {
+            self.status = "This ROM has no battery save".into();
+            return;
+        };
+        let Some(gb) = self.gb.as_ref() else { return };
+        let result = saves::write(&path, gb.bus.cart.ram());
+        match result {
+            Ok(()) => {
+                self.unsaved_ram = false;
+                self.status = format!("Saved to {}", path.display());
+            }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
@@ -287,6 +307,13 @@ impl EmulatorApp {
                         .clicked()
                     {
                         gb.step_frame();
+                    }
+                    if ui
+                        .add_enabled(self.save_path.is_some(), egui::Button::new("💾 Save now"))
+                        .on_hover_text("Write battery RAM to the .sav file")
+                        .clicked()
+                    {
+                        self.save_requested = true;
                     }
                 });
                 ui.separator();
@@ -508,6 +535,10 @@ impl eframe::App for EmulatorApp {
 
         if self.show_debugger {
             self.debugger_ui(ctx);
+        }
+        if self.save_requested {
+            self.save_requested = false;
+            self.save_now();
         }
 
         egui::CentralPanel::default()

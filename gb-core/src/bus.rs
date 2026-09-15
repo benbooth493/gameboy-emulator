@@ -16,8 +16,9 @@ pub struct Bus {
     pub timer: Timer,
     pub joypad: Joypad,
     pub ints: Interrupts,
+    /// 8 banks of 4 KiB (CGB); DMG uses banks 0-1.
     #[serde(with = "serde_big_array::BigArray")]
-    pub wram: [u8; 0x2000],
+    pub wram: [u8; 0x8000],
     #[serde(with = "serde_big_array::BigArray")]
     pub hram: [u8; 0x7F],
     serial_data: u8,
@@ -28,24 +29,53 @@ pub struct Bus {
     pub serial_out: Vec<u8>,
     dma_src: u8,
     dma_countdown: u16, // remaining T-cycles of an active OAM DMA
+    /// True for CGB ROMs: enables WRAM/VRAM banking and colour rendering.
+    pub cgb: bool,
+    /// WRAM bank select (SVBK); bank 0 maps to 1.
+    svbk: u8,
+    /// KEY1 double-speed "armed" bit (speed switching itself is not yet done).
+    key1: u8,
+    /// CGB VRAM DMA source/destination, latched from HDMA1-4.
+    hdma_src: u16,
+    hdma_dst: u16,
 }
 
 impl Bus {
     pub fn new(cart: Cartridge) -> Self {
+        let cgb = cart.read(0x0143) & 0x80 != 0;
+        let mut ppu = Ppu::default();
+        ppu.set_cgb(cgb);
         Bus {
             cart,
-            ppu: Ppu::default(),
+            ppu,
             apu: Apu::default(),
             timer: Timer::default(),
             joypad: Joypad::default(),
             ints: Interrupts::default(),
-            wram: [0; 0x2000],
+            wram: [0; 0x8000],
             hram: [0; 0x7F],
             serial_data: 0,
             serial_ctrl: 0,
             serial_out: Vec::new(),
             dma_src: 0,
             dma_countdown: 0,
+            cgb,
+            svbk: 1,
+            key1: 0,
+            hdma_src: 0,
+            hdma_dst: 0,
+        }
+    }
+
+    /// Map a 0xC000-0xDFFF (or echo) address to a flat WRAM index, honouring
+    /// the CGB bank select for the 0xD000-0xDFFF window.
+    fn wram_index(&self, addr: u16) -> usize {
+        let off = (addr & 0x1FFF) as usize; // 0..0x2000 within C000-DFFF/echo
+        if off < 0x1000 {
+            off
+        } else {
+            let bank = (self.svbk as usize & 0x07).max(1);
+            bank * 0x1000 + (off - 0x1000)
         }
     }
 
@@ -53,8 +83,8 @@ impl Bus {
         match addr {
             0x0000..=0x7FFF | 0xA000..=0xBFFF => self.cart.read(addr),
             0x8000..=0x9FFF => self.ppu.read(addr),
-            0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize],
-            0xE000..=0xFDFF => self.wram[(addr - 0xE000) as usize], // echo RAM
+            0xC000..=0xDFFF => self.wram[self.wram_index(addr)],
+            0xE000..=0xFDFF => self.wram[self.wram_index(addr)], // echo RAM
             0xFE00..=0xFE9F => self.ppu.read(addr),
             0xFEA0..=0xFEFF => 0xFF,
             0xFF00 => self.joypad.read(),
@@ -64,7 +94,12 @@ impl Bus {
             0xFF0F => self.ints.request | 0xE0,
             0xFF10..=0xFF3F => self.apu.read(addr),
             0xFF46 => self.dma_src,
+            0xFF4D => 0x7E | (self.key1 & 0x01), // KEY1: current speed 0 for now
             0xFF40..=0xFF4B => self.ppu.read(addr),
+            0xFF4F => self.ppu.read(addr),                 // VBK
+            0xFF55 => 0xFF,                                // VRAM DMA idle/complete
+            0xFF68..=0xFF6B => self.ppu.read(addr),        // BG/OBJ palettes
+            0xFF70 => 0xF8 | (self.svbk & 0x07),           // SVBK
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize],
             0xFFFF => self.ints.enable,
             _ => 0xFF,
@@ -75,8 +110,8 @@ impl Bus {
         match addr {
             0x0000..=0x7FFF | 0xA000..=0xBFFF => self.cart.write(addr, val),
             0x8000..=0x9FFF => self.ppu.write(addr, val, &mut self.ints),
-            0xC000..=0xDFFF => self.wram[(addr - 0xC000) as usize] = val,
-            0xE000..=0xFDFF => self.wram[(addr - 0xE000) as usize] = val,
+            0xC000..=0xDFFF => self.wram[self.wram_index(addr)] = val,
+            0xE000..=0xFDFF => self.wram[self.wram_index(addr)] = val,
             0xFE00..=0xFE9F => self.ppu.write(addr, val, &mut self.ints),
             0xFEA0..=0xFEFF => {}
             0xFF00 => self.joypad.write(val),
@@ -96,10 +131,32 @@ impl Bus {
             0xFF0F => self.ints.request = val & 0x1F,
             0xFF10..=0xFF3F => self.apu.write(addr, val),
             0xFF46 => self.start_dma(val),
+            0xFF4D => self.key1 = (self.key1 & 0x80) | (val & 0x01),
             0xFF40..=0xFF4B => self.ppu.write(addr, val, &mut self.ints),
+            0xFF4F => self.ppu.write(addr, val, &mut self.ints), // VBK
+            0xFF51 => self.hdma_src = (self.hdma_src & 0x00FF) | ((val as u16) << 8),
+            0xFF52 => self.hdma_src = (self.hdma_src & 0xFF00) | (val as u16 & 0xF0),
+            0xFF53 => self.hdma_dst = (self.hdma_dst & 0x00FF) | (((val as u16) & 0x1F) << 8),
+            0xFF54 => self.hdma_dst = (self.hdma_dst & 0xFF00) | (val as u16 & 0xF0),
+            0xFF55 => self.vram_dma(val),
+            0xFF68..=0xFF6B => self.ppu.write(addr, val, &mut self.ints), // palettes
+            0xFF70 => self.svbk = val & 0x07,
             0xFF80..=0xFFFE => self.hram[(addr - 0xFF80) as usize] = val,
             0xFFFF => self.ints.enable = val,
             _ => {}
+        }
+    }
+
+    /// CGB VRAM DMA (HDMA5). Both general-purpose (bit 7 clear) and HBlank
+    /// (bit 7 set) transfers are performed immediately here; sub-frame HBlank
+    /// pacing is a later refinement.
+    fn vram_dma(&mut self, ctrl: u8) {
+        let len = ((ctrl as u16 & 0x7F) + 1) * 0x10;
+        let src = self.hdma_src & 0xFFF0;
+        let dst = 0x8000 | (self.hdma_dst & 0x1FF0);
+        for i in 0..len {
+            let b = self.read(src.wrapping_add(i));
+            self.ppu.write(dst.wrapping_add(i), b, &mut self.ints);
         }
     }
 

@@ -35,12 +35,37 @@ pub enum Mode {
     Drawing = 3,
 }
 
+/// The classic DMG green palette, lightest shade first.
+const DMG_PALETTE: [[u8; 3]; 4] = [
+    [155, 188, 15],
+    [139, 172, 15],
+    [48, 98, 48],
+    [15, 56, 15],
+];
+
+fn blank_framebuffer() -> [u8; SCREEN_W * SCREEN_H * 4] {
+    [0; SCREEN_W * SCREEN_H * 4]
+}
+
+/// Expand a 15-bit CGB colour (little-endian in two bytes) to RGB888.
+fn rgb555_to_rgb888(lo: u8, hi: u8) -> [u8; 3] {
+    let v = ((hi as u16) << 8) | lo as u16;
+    let r5 = (v & 0x1F) as u8;
+    let g5 = ((v >> 5) & 0x1F) as u8;
+    let b5 = ((v >> 10) & 0x1F) as u8;
+    [(r5 << 3) | (r5 >> 2), (g5 << 3) | (g5 >> 2), (b5 << 3) | (b5 >> 2)]
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Ppu {
+    /// Two 8 KiB banks (CGB); DMG uses only bank 0.
     #[serde(with = "BigArray")]
-    pub vram: [u8; 0x2000],
+    pub vram: [u8; 0x4000],
+    vram_bank: usize,
     #[serde(with = "BigArray")]
     pub oam: [u8; 0xA0],
+    /// True when running a CGB ROM (colour rendering + banking).
+    cgb: bool,
     pub lcdc: u8,
     pub stat: u8,
     pub scy: u8,
@@ -52,12 +77,22 @@ pub struct Ppu {
     pub obp1: u8,
     pub wy: u8,
     pub wx: u8,
+    /// CGB background palette memory (8 palettes x 4 colours x 2 bytes) and its
+    /// auto-incrementing index register (BCPS).
+    #[serde(with = "BigArray")]
+    bg_pram: [u8; 64],
+    bcps: u8,
+    #[serde(with = "BigArray")]
+    obj_pram: [u8; 64],
+    ocps: u8,
     mode: Mode,
     dot: u32,
     window_line: u8,
-    /// Shade indices 0..=3 per pixel.
-    #[serde(with = "BigArray")]
-    pub framebuffer: [u8; SCREEN_W * SCREEN_H],
+    /// RGBA8 output, one pixel per (x, y): the PPU produces final colours so
+    /// the shader is colour-agnostic. Transient (re-rendered every frame), so
+    /// it is excluded from save states.
+    #[serde(skip, default = "blank_framebuffer")]
+    pub framebuffer: [u8; SCREEN_W * SCREEN_H * 4],
     /// Set when a full frame has just been completed; caller clears it.
     pub frame_ready: bool,
 }
@@ -65,8 +100,10 @@ pub struct Ppu {
 impl Default for Ppu {
     fn default() -> Self {
         Ppu {
-            vram: [0; 0x2000],
+            vram: [0; 0x4000],
+            vram_bank: 0,
             oam: [0; 0xA0],
+            cgb: false,
             lcdc: 0x91,
             stat: 0x04, // LY==LYC at boot; mode bits are never stored
             scy: 0,
@@ -78,10 +115,14 @@ impl Default for Ppu {
             obp1: 0xFF,
             wy: 0,
             wx: 0,
+            bg_pram: [0xFF; 64],
+            bcps: 0,
+            obj_pram: [0xFF; 64],
+            ocps: 0,
             mode: Mode::OamScan,
             dot: 0,
             window_line: 0,
-            framebuffer: [0; SCREEN_W * SCREEN_H],
+            framebuffer: [0; SCREEN_W * SCREEN_H * 4],
             frame_ready: false,
         }
     }
@@ -92,9 +133,17 @@ impl Ppu {
         self.mode
     }
 
+    pub fn set_cgb(&mut self, cgb: bool) {
+        self.cgb = cgb;
+    }
+
+    fn vram_byte(&self, bank: usize, off: usize) -> u8 {
+        self.vram[bank * 0x2000 + off]
+    }
+
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
-            0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize],
+            0x8000..=0x9FFF => self.vram[self.vram_bank * 0x2000 + (addr - 0x8000) as usize],
             0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize],
             0xFF40 => self.lcdc,
             // Bits 3-6 are the stored interrupt enables, bit 2 the LYC flag;
@@ -109,14 +158,36 @@ impl Ppu {
             0xFF49 => self.obp1,
             0xFF4A => self.wy,
             0xFF4B => self.wx,
+            0xFF4F => 0xFE | self.vram_bank as u8, // VBK
+            0xFF68 => self.bcps,
+            0xFF69 => self.bg_pram[(self.bcps & 0x3F) as usize],
+            0xFF6A => self.ocps,
+            0xFF6B => self.obj_pram[(self.ocps & 0x3F) as usize],
             _ => 0xFF,
         }
     }
 
     pub fn write(&mut self, addr: u16, val: u8, ints: &mut Interrupts) {
         match addr {
-            0x8000..=0x9FFF => self.vram[(addr - 0x8000) as usize] = val,
+            0x8000..=0x9FFF => {
+                self.vram[self.vram_bank * 0x2000 + (addr - 0x8000) as usize] = val
+            }
             0xFE00..=0xFE9F => self.oam[(addr - 0xFE00) as usize] = val,
+            0xFF4F => self.vram_bank = (val & 1) as usize,
+            0xFF68 => self.bcps = val,
+            0xFF69 => {
+                self.bg_pram[(self.bcps & 0x3F) as usize] = val;
+                if self.bcps & 0x80 != 0 {
+                    self.bcps = 0x80 | ((self.bcps + 1) & 0x3F);
+                }
+            }
+            0xFF6A => self.ocps = val,
+            0xFF6B => {
+                self.obj_pram[(self.ocps & 0x3F) as usize] = val;
+                if self.ocps & 0x80 != 0 {
+                    self.ocps = 0x80 | ((self.ocps + 1) & 0x3F);
+                }
+            }
             0xFF40 => {
                 let was_on = self.lcdc & LCDC_ENABLE != 0;
                 self.lcdc = val;
@@ -225,13 +296,34 @@ impl Ppu {
         }
     }
 
-    fn tile_row(&self, tile_idx: u8, row: usize, signed_addressing: bool) -> (u8, u8) {
+    /// Fetch a tile row's two bitplanes from a given VRAM bank.
+    fn tile_row(&self, tile_idx: u8, row: usize, signed_addressing: bool, bank: usize) -> (u8, u8) {
         let base = if signed_addressing {
             (0x1000i32 + (tile_idx as i8 as i32) * 16) as usize
         } else {
             tile_idx as usize * 16
         };
-        (self.vram[base + row * 2], self.vram[base + row * 2 + 1])
+        (
+            self.vram_byte(bank, base + row * 2),
+            self.vram_byte(bank, base + row * 2 + 1),
+        )
+    }
+
+    fn dmg_bg_rgb(&self, color_id: u8) -> [u8; 3] {
+        DMG_PALETTE[((self.bgp >> (color_id * 2)) & 0x03) as usize]
+    }
+
+    fn cgb_color(pram: &[u8; 64], palette: u8, color_id: u8) -> [u8; 3] {
+        let i = (palette as usize * 8) + color_id as usize * 2;
+        rgb555_to_rgb888(pram[i], pram[i + 1])
+    }
+
+    fn put_pixel(&mut self, x: usize, y: usize, rgb: [u8; 3]) {
+        let o = (y * SCREEN_W + x) * 4;
+        self.framebuffer[o] = rgb[0];
+        self.framebuffer[o + 1] = rgb[1];
+        self.framebuffer[o + 2] = rgb[2];
+        self.framebuffer[o + 3] = 0xFF;
     }
 
     #[allow(clippy::needless_range_loop)] // indexed pixel loops are clearer here
@@ -240,54 +332,72 @@ impl Ppu {
         if y >= SCREEN_H {
             return;
         }
-        // Raw BG colour index (pre-palette) per pixel, needed for sprite priority.
+        // Per-pixel background colour id (0..=3) and CGB BG-over-OBJ priority.
         let mut bg_index = [0u8; SCREEN_W];
+        let mut bg_priority = [false; SCREEN_W];
 
-        if self.lcdc & LCDC_BG_ENABLE != 0 {
-            let signed = self.lcdc & LCDC_TILE_DATA == 0;
-            // Background
-            let map_base: usize = if self.lcdc & LCDC_BG_MAP != 0 { 0x1C00 } else { 0x1800 };
+        // On DMG, LCDC bit 0 disables the background entirely; on CGB it only
+        // demotes BG priority, so the layer is always drawn.
+        let draw_bg = self.cgb || self.lcdc & LCDC_BG_ENABLE != 0;
+        let signed = self.lcdc & LCDC_TILE_DATA == 0;
+
+        if draw_bg {
+            let win_active =
+                self.lcdc & LCDC_WIN_ENABLE != 0 && self.wy as usize <= y && self.wx < 167;
+            let win_start = self.wx.saturating_sub(7) as usize;
+            let bg_map: usize = if self.lcdc & LCDC_BG_MAP != 0 { 0x1C00 } else { 0x1800 };
+            let win_map: usize = if self.lcdc & LCDC_WIN_MAP != 0 { 0x1C00 } else { 0x1800 };
             let bg_y = (y as u8).wrapping_add(self.scy) as usize;
+            let mut drew_window = false;
+
             for x in 0..SCREEN_W {
-                let bg_x = (x as u8).wrapping_add(self.scx) as usize;
-                let tile = self.vram[map_base + (bg_y / 8) * 32 + bg_x / 8];
-                let (lo, hi) = self.tile_row(tile, bg_y % 8, signed);
-                let bit = 7 - (bg_x % 8);
+                let in_window = win_active && x >= win_start;
+                let (map_base, tx, ty) = if in_window {
+                    drew_window = true;
+                    let wx = x + 7 - self.wx as usize;
+                    (win_map, wx, self.window_line as usize)
+                } else {
+                    (bg_map, (x as u8).wrapping_add(self.scx) as usize, bg_y)
+                };
+                let map_off = map_base + (ty / 8) * 32 + tx / 8;
+                let tile = self.vram_byte(0, map_off);
+                // CGB tile attribute lives at the same offset in bank 1.
+                let attr = if self.cgb { self.vram_byte(1, map_off) } else { 0 };
+                let tile_bank = if self.cgb && attr & 0x08 != 0 { 1 } else { 0 };
+                let mut row = ty % 8;
+                if self.cgb && attr & 0x40 != 0 {
+                    row = 7 - row; // Y flip
+                }
+                let (lo, hi) = self.tile_row(tile, row, signed, tile_bank);
+                let mut col = tx % 8;
+                if self.cgb && attr & 0x20 != 0 {
+                    col = 7 - col; // X flip
+                }
+                let bit = 7 - col;
                 let idx = ((hi >> bit) & 1) << 1 | ((lo >> bit) & 1);
                 bg_index[x] = idx;
+                bg_priority[x] = self.cgb && attr & 0x80 != 0;
+                let rgb = if self.cgb {
+                    Self::cgb_color(&self.bg_pram, attr & 0x07, idx)
+                } else {
+                    self.dmg_bg_rgb(idx)
+                };
+                self.put_pixel(x, y, rgb);
             }
-            // Window
-            if self.lcdc & LCDC_WIN_ENABLE != 0 && self.wy as usize <= y && self.wx < 167 {
-                let map_base: usize =
-                    if self.lcdc & LCDC_WIN_MAP != 0 { 0x1C00 } else { 0x1800 };
-                let win_y = self.window_line as usize;
-                let start_x = self.wx.saturating_sub(7) as usize;
-                let mut drew = false;
-                for x in start_x..SCREEN_W {
-                    let win_x = x + 7 - self.wx as usize;
-                    let tile = self.vram[map_base + (win_y / 8) * 32 + win_x / 8];
-                    let (lo, hi) = self.tile_row(tile, win_y % 8, signed);
-                    let bit = 7 - (win_x % 8);
-                    let idx = ((hi >> bit) & 1) << 1 | ((lo >> bit) & 1);
-                    bg_index[x] = idx;
-                    drew = true;
-                }
-                if drew {
-                    self.window_line += 1;
-                }
+            if drew_window {
+                self.window_line += 1;
+            }
+        } else {
+            // Background off (DMG): the scanline is blank white.
+            for x in 0..SCREEN_W {
+                self.put_pixel(x, y, DMG_PALETTE[0]);
             }
         }
 
-        let mut line = [0u8; SCREEN_W];
-        for x in 0..SCREEN_W {
-            line[x] = (self.bgp >> (bg_index[x] * 2)) & 0x03;
-        }
-
-        // Sprites
         if self.lcdc & LCDC_OBJ_ENABLE != 0 {
             let tall = self.lcdc & LCDC_OBJ_SIZE != 0;
             let height = if tall { 16i32 } else { 8 };
-            // Collect up to 10 sprites on this line, in OAM order.
+            // Up to 10 sprites on this line, in OAM order.
             let mut sprites: Vec<(i32, usize)> = Vec::with_capacity(10);
             for i in 0..40 {
                 let sy = self.oam[i * 4] as i32 - 16;
@@ -298,9 +408,16 @@ impl Ppu {
                     }
                 }
             }
-            // DMG priority: lower X wins; ties broken by OAM order.
-            // Draw in reverse priority so higher-priority sprites overwrite.
-            sprites.sort_by_key(|&(x, i)| (x, i));
+            // Priority: DMG breaks ties by X then OAM index; CGB is OAM index
+            // only. Draw lowest priority first so higher-priority overwrites.
+            if self.cgb {
+                sprites.sort_by_key(|&(_, i)| i);
+            } else {
+                sprites.sort_by_key(|&(x, i)| (x, i));
+            }
+            // Master priority: on CGB, LCDC bit 0 clear lets sprites cover BG.
+            let bg_master = !self.cgb || self.lcdc & LCDC_BG_ENABLE != 0;
+
             for &(sx, i) in sprites.iter().rev() {
                 let sy = self.oam[i * 4] as i32 - 16;
                 let mut tile = self.oam[i * 4 + 2];
@@ -316,27 +433,36 @@ impl Ppu {
                         row -= 8;
                     }
                 }
-                let (lo, hi) = self.tile_row(tile, row as usize, false);
-                let palette = if attr & 0x10 != 0 { self.obp1 } else { self.obp0 };
+                let bank = if self.cgb && attr & 0x08 != 0 { 1 } else { 0 };
+                let (lo, hi) = self.tile_row(tile, row as usize, false, bank);
                 for px in 0..8i32 {
                     let x = sx + px;
                     if !(0..SCREEN_W as i32).contains(&x) {
                         continue;
                     }
+                    let xu = x as usize;
                     let bit = if attr & 0x20 != 0 { px } else { 7 - px }; // X flip
                     let idx = ((hi >> bit) & 1) << 1 | ((lo >> bit) & 1);
                     if idx == 0 {
                         continue; // transparent
                     }
-                    if attr & 0x80 != 0 && bg_index[x as usize] != 0 {
-                        continue; // behind non-zero BG
+                    // Sprite loses to BG where BG has priority and is non-zero.
+                    let bg_wins = bg_master
+                        && bg_index[xu] != 0
+                        && (bg_priority[xu] || attr & 0x80 != 0);
+                    if bg_wins {
+                        continue;
                     }
-                    line[x as usize] = (palette >> (idx * 2)) & 0x03;
+                    let rgb = if self.cgb {
+                        Self::cgb_color(&self.obj_pram, attr & 0x07, idx)
+                    } else {
+                        let palette = if attr & 0x10 != 0 { self.obp1 } else { self.obp0 };
+                        DMG_PALETTE[((palette >> (idx * 2)) & 0x03) as usize]
+                    };
+                    self.put_pixel(xu, y, rgb);
                 }
             }
         }
-
-        self.framebuffer[y * SCREEN_W..(y + 1) * SCREEN_W].copy_from_slice(&line);
     }
 }
 
@@ -346,6 +472,13 @@ mod tests {
 
     fn run_line(ppu: &mut Ppu, ints: &mut Interrupts) {
         ppu.tick(456, ints);
+    }
+
+    /// The DMG shade index (0..=3) of a rendered pixel, via the green palette.
+    fn shade_at(ppu: &Ppu, x: usize) -> u8 {
+        let o = x * 4;
+        let rgb = [ppu.framebuffer[o], ppu.framebuffer[o + 1], ppu.framebuffer[o + 2]];
+        DMG_PALETTE.iter().position(|&c| c == rgb).unwrap() as u8
     }
 
     #[test]
@@ -405,7 +538,7 @@ mod tests {
         // BG map already zeroed -> tile 0 everywhere. BGP identity: 11 10 01 00.
         ppu.bgp = 0b11100100;
         run_line(&mut ppu, &mut ints);
-        assert!(ppu.framebuffer[..SCREEN_W].iter().all(|&p| p == 3));
+        assert!((0..SCREEN_W).all(|x| shade_at(&ppu, x) == 3));
     }
 
     #[test]
@@ -417,7 +550,7 @@ mod tests {
         }
         ppu.bgp = 0b00_11_11_11; // index 3 -> shade 0
         run_line(&mut ppu, &mut ints);
-        assert!(ppu.framebuffer[..SCREEN_W].iter().all(|&p| p == 0));
+        assert!((0..SCREEN_W).all(|x| shade_at(&ppu, x) == 0));
     }
 
     #[test]
@@ -437,9 +570,9 @@ mod tests {
         ppu.oam[2] = 1;
         ppu.oam[3] = 0;
         run_line(&mut ppu, &mut ints);
-        assert_eq!(ppu.framebuffer[0], 1);
-        assert_eq!(ppu.framebuffer[7], 1);
-        assert_eq!(ppu.framebuffer[8], 0);
+        assert_eq!(shade_at(&ppu, 0), 1);
+        assert_eq!(shade_at(&ppu, 7), 1);
+        assert_eq!(shade_at(&ppu, 8), 0);
     }
 
     #[test]

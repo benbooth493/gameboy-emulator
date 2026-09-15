@@ -54,6 +54,11 @@ or start it empty and use **File → Open ROM…** / drag & drop.
 | Enter / Backspace | Start / Select |
 | P | Pause/continue |
 | N | Single-step (while paused) |
+| F5 / F9 | Save / load state |
+
+A **game controller** (Bluetooth or USB, paired through the OS) works too, via
+`gilrs`: D-pad or left stick for direction, South = A, East = B, Start/Select
+mapped through. Keyboard and controller are read together.
 
 ## Tests
 

@@ -15,3 +15,4 @@ bytemuck = { version = "1", features = ["derive"] }
 env_logger = "0.11"
 rfd = "0.17"
 pollster = "0.4"
+gilrs = "0.11"

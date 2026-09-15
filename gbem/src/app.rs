@@ -9,6 +9,7 @@ use gb_core::disasm::disassemble;
 use gb_core::{Button, Cartridge, GameBoy, SCREEN_H, SCREEN_W};
 
 use crate::audio::Audio;
+use crate::gamepad::Gamepad;
 use crate::pacing::{Clock, Pacer, GB_FPS};
 use crate::saves;
 use crate::screen::{ScreenCallback, ScreenRenderer};
@@ -19,6 +20,7 @@ const AUTOSAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2)
 pub struct EmulatorApp {
     gb: Option<GameBoy>,
     audio: Audio,
+    gamepad: Gamepad,
     prev_frame: Vec<u8>,
     cur_frame: Vec<u8>,
     show_debugger: bool,
@@ -71,6 +73,7 @@ impl EmulatorApp {
         let mut app = EmulatorApp {
             gb: None,
             audio,
+            gamepad: Gamepad::new(),
             pacer,
             prev_frame: vec![0; SCREEN_W * SCREEN_H * 4],
             cur_frame: vec![0; SCREEN_W * SCREEN_H * 4],
@@ -221,6 +224,7 @@ impl EmulatorApp {
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
+        let pad = self.gamepad.poll();
         let Some(gb) = self.gb.as_mut() else { return };
 
         // Debug auto-navigation: tap Start until the game reports in-game,
@@ -232,23 +236,21 @@ impl EmulatorApp {
         }
 
         ctx.input(|i| {
-            let map = [
-                (egui::Key::ArrowUp, Button::Up),
-                (egui::Key::ArrowDown, Button::Down),
-                (egui::Key::ArrowLeft, Button::Left),
-                (egui::Key::ArrowRight, Button::Right),
-                (egui::Key::Z, Button::A),
-                (egui::Key::X, Button::B),
-                (egui::Key::Enter, Button::Start),
-                (egui::Key::Backspace, Button::Select),
+            // Each button is pressed if its key is held OR the pad reports it.
+            // `set_button` only raises the joypad interrupt on a fresh press,
+            // so setting the combined state every frame is correct.
+            let buttons = [
+                (egui::Key::ArrowUp, Button::Up, pad.up),
+                (egui::Key::ArrowDown, Button::Down, pad.down),
+                (egui::Key::ArrowLeft, Button::Left, pad.left),
+                (egui::Key::ArrowRight, Button::Right, pad.right),
+                (egui::Key::Z, Button::A, pad.a),
+                (egui::Key::X, Button::B, pad.b),
+                (egui::Key::Enter, Button::Start, pad.start),
+                (egui::Key::Backspace, Button::Select, pad.select),
             ];
-            for (key, btn) in map {
-                if i.key_pressed(key) {
-                    gb.set_button(btn, true);
-                }
-                if i.key_released(key) {
-                    gb.set_button(btn, false);
-                }
+            for (key, btn, padded) in buttons {
+                gb.set_button(btn, i.key_down(key) || padded);
             }
             if i.key_pressed(egui::Key::P) {
                 gb.toggle_pause();

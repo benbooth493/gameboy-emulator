@@ -3,6 +3,7 @@
 use crate::interrupts::{Interrupts, INT_TIMER};
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Timer {
     /// 16-bit internal divider; DIV is the upper 8 bits.
     div: u16,

@@ -9,7 +9,7 @@ pub const INT_JOYPAD: u8 = 1 << 4;
 /// The interrupt-enable (IE, 0xFFFF) and interrupt-request (IF, 0xFF0F)
 /// registers. Peripherals `raise` bits here; the CPU reads them through the
 /// memory seam and owns the priority/vector dispatch.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Interrupts {
     pub enable: u8,  // IE
     pub request: u8, // IF

@@ -11,7 +11,7 @@ const WAVE_DUTY: [[u8; 8]; 4] = [
 
 const CPU_HZ: u32 = 4_194_304;
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 struct Envelope {
     initial_volume: u8,
     direction_up: bool,
@@ -58,7 +58,7 @@ impl Envelope {
 /// The length counter shared by all four channels: when enabled it counts
 /// down on each frame-sequencer length clock and disables its channel at zero.
 /// `max` is 64 for the pulse and noise channels, 256 for the wave channel.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct LengthCounter {
     counter: u16,
     enabled: bool,
@@ -108,7 +108,7 @@ impl LengthCounter {
 /// channel-supplied period. `step` advances it by `cycles` T-cycles and reports
 /// how many times it expired, so each channel can advance its own waveform
 /// (duty step, wave position, LFSR shift) that many times.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 struct FrequencyTimer {
     counter: u32,
 }
@@ -137,7 +137,7 @@ impl FrequencyTimer {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Pulse {
     enabled: bool,
     duty: u8,
@@ -249,7 +249,7 @@ impl Pulse {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Wave {
     enabled: bool,
     dac_on: bool,
@@ -321,7 +321,7 @@ impl Wave {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Noise {
     enabled: bool,
     length: LengthCounter,
@@ -392,6 +392,7 @@ impl Noise {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Apu {
     enabled: bool,
     ch1: Pulse,
@@ -404,7 +405,9 @@ pub struct Apu {
     frame_timer: u32,
     sample_rate: u32,
     sample_counter: u32,
-    /// Interleaved stereo samples produced since last drain.
+    /// Interleaved stereo samples produced since last drain. Transient output,
+    /// not machine state — excluded from save states.
+    #[serde(skip)]
     pub samples: Vec<f32>,
 }
 

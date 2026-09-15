@@ -5,7 +5,7 @@ pub const FLAG_N: u8 = 0x40;
 pub const FLAG_H: u8 = 0x20;
 pub const FLAG_C: u8 = 0x10;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Registers {
     pub a: u8,
     pub f: u8,

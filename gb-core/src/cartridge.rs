@@ -1,7 +1,7 @@
 //! Cartridge loading and MBC (memory bank controller) emulation.
 //! Supports ROM-only, MBC1, MBC3 (incl. battery RAM), and MBC5.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MbcKind {
     None,
     Mbc1,
@@ -9,7 +9,11 @@ pub enum MbcKind {
     Mbc5,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Cartridge {
+    /// The ROM image. Immutable and large, so it is excluded from save states
+    /// (the loaded cartridge already holds it) and restored by the host.
+    #[serde(skip)]
     pub rom: Vec<u8>,
     pub ram: Vec<u8>,
     pub kind: MbcKind,
@@ -169,6 +173,18 @@ impl Cartridge {
             self.ram[idx] = val;
             self.ram_dirty = true;
         }
+    }
+
+    /// A short identity for binding save states to this ROM: the 16-byte title
+    /// area plus the 2-byte global checksum. A state whose identity differs is
+    /// from another game and must be rejected.
+    pub fn rom_identity(&self) -> [u8; 18] {
+        let mut id = [0u8; 18];
+        if self.rom.len() >= 0x150 {
+            id[..16].copy_from_slice(&self.rom[0x134..0x144]);
+            id[16..].copy_from_slice(&self.rom[0x14E..0x150]);
+        }
+        id
     }
 
     /// Whether this cartridge has battery-backed RAM worth persisting.

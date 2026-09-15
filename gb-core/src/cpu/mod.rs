@@ -12,7 +12,7 @@ const VECTORS: [u16; 5] = [0x40, 0x48, 0x50, 0x58, 0x60];
 const IF_ADDR: u16 = 0xFF0F;
 const IE_ADDR: u16 = 0xFFFF;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Cpu {
     pub regs: Registers,
     pub ime: bool,

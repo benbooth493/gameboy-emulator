@@ -23,15 +23,24 @@ fn dmg_acid2_matches_reference() {
         gb.run_frame();
     }
 
+    // The framebuffer is RGBA; the PPU renders DMG shades through this palette.
+    const DMG_PALETTE: [[u8; 3]; 4] = [
+        [155, 188, 15],
+        [139, 172, 15],
+        [48, 98, 48],
+        [15, 56, 15],
+    ];
     let fb = gb.framebuffer();
-    let diff = fb
-        .iter()
-        .zip(reference.iter())
-        .filter(|(a, b)| a != b)
+    let diff = (0..SCREEN_W * SCREEN_H)
+        .filter(|&i| {
+            let rgb = [fb[i * 4], fb[i * 4 + 1], fb[i * 4 + 2]];
+            let shade = DMG_PALETTE.iter().position(|&c| c == rgb).unwrap_or(255) as u8;
+            shade != reference[i]
+        })
         .count();
     assert_eq!(
         diff, 0,
         "dmg-acid2: {diff} of {} pixels differ from the reference",
-        fb.len()
+        SCREEN_W * SCREEN_H
     );
 }

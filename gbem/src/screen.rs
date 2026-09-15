@@ -38,7 +38,7 @@ impl ScreenRenderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R8Unorm,
+                format: wgpu::TextureFormat::Rgba8Unorm,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             })
@@ -166,9 +166,8 @@ impl ScreenRenderer {
         }
     }
 
-    fn upload(&self, queue: &wgpu::Queue, tex: &wgpu::Texture, shades: &[u8]) {
-        // Expand 0..3 to 0..255 so R8Unorm sampling lands on 0, 1/3, 2/3, 1.
-        let bytes: Vec<u8> = shades.iter().map(|&s| s * 85).collect();
+    fn upload(&self, queue: &wgpu::Queue, tex: &wgpu::Texture, rgba: &[u8]) {
+        // The PPU already produces final RGBA colours (DMG green or CGB colour).
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: tex,
@@ -176,10 +175,10 @@ impl ScreenRenderer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &bytes,
+            rgba,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(SCREEN_W as u32),
+                bytes_per_row: Some(SCREEN_W as u32 * 4),
                 rows_per_image: Some(SCREEN_H as u32),
             },
             wgpu::Extent3d {

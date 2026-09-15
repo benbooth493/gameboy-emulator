@@ -37,37 +37,20 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 }
 
 // The classic DMG palette, lightest to darkest.
-const P0: vec3<f32> = vec3<f32>(0.608, 0.737, 0.059);
-const P1: vec3<f32> = vec3<f32>(0.545, 0.675, 0.059);
-const P2: vec3<f32> = vec3<f32>(0.188, 0.384, 0.188);
-const P3: vec3<f32> = vec3<f32>(0.059, 0.220, 0.059);
-
-fn palette(shade: f32) -> vec3<f32> {
-    // shade in [0,1] quantised to 4 levels; interpolate for ghosted values.
-    let s = shade * 3.0;
-    if s < 1.0 {
-        return mix(P0, P1, fract(s));
-    } else if s < 2.0 {
-        return mix(P1, P2, fract(s));
-    }
-    return mix(P2, P3, fract(s));
-}
-
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let res = u.params.xy;
     let ghost = u.params.z;
     let grid_strength = u.params.w;
 
-    // Sample with nearest-pixel snapping for crisp cells.
+    // Sample with nearest-pixel snapping for crisp cells. The PPU already
+    // produces final RGB (DMG green or CGB colour), so we work in colour space.
     let texel = (floor(in.uv * res) + 0.5) / res;
-    let cur = textureSample(t_cur, samp, texel).r;
-    let prev = textureSample(t_prev, samp, texel).r;
+    let cur = textureSample(t_cur, samp, texel).rgb;
+    let prev = textureSample(t_prev, samp, texel).rgb;
 
     // LCD response-time ghosting: the old image lingers.
-    let shade = mix(cur, prev, ghost);
-
-    var color = palette(shade);
+    var color = mix(cur, prev, ghost);
 
     // Pixel grid: darken cell borders like the visible DMG pixel matrix.
     let cell = fract(in.uv * res);

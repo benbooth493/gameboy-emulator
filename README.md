@@ -7,8 +7,10 @@ DMG LCD, and a built-in debugger.
 ## Features
 
 - **Complete SM83 CPU** — full instruction set (including CB prefix),
-  interrupts, HALT (with the HALT bug), delayed EI. Verified against
-  Blargg's `cpu_instrs` and `instr_timing` hardware test ROMs.
+  interrupts, HALT (with the HALT bug), delayed EI. **M-cycle accurate**: the
+  CPU drives the bus one M-cycle per access, so peripherals advance mid-
+  instruction. Verified against Blargg's `cpu_instrs`, `instr_timing`, and
+  `mem_timing`.
 - **PPU** — scanline renderer: background, window, 8x8/8x16 sprites with
   DMG priority rules, mode timing, STAT/LYC interrupts. Outputs RGBA.
   Verified pixel-perfect against **dmg-acid2** and **cgb-acid2**.
@@ -65,10 +67,9 @@ Conformance ROMs live in `test-roms/` (git-ignored) and each test skips
 gracefully if its ROM is absent:
 
 - **Blargg** `cpu_instrs`, `instr_timing`, `mem_timing` (from the
-  `retrio/gb-test-roms` mirror). `cpu_instrs`/`instr_timing` pass.
-  `mem_timing` is `#[ignore]`d: it checks *sub-instruction* memory-access
-  timing, which the instruction-atomic CPU can't reproduce without a
-  cycle-accurate rewrite. Run it with `--ignored` to see the gap.
+  `retrio/gb-test-roms` mirror) — all pass. The CPU is M-cycle accurate: it
+  drives the bus one M-cycle per memory access, so reads/writes land on the
+  correct cycle within an instruction.
 - **dmg-acid2** (matt currie) — renders a reference image exercising the
   background, window, and sprites (flips, priority, 8x16, palettes). The test
   compares the framebuffer pixel-for-pixel against the checked-in reference

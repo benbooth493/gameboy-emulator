@@ -5,22 +5,34 @@
 use gb_core::cpu::registers::{FLAG_C, FLAG_H, FLAG_N, FLAG_Z};
 use gb_core::cpu::Cpu;
 use gb_core::interrupts::INT_VBLANK;
-use gb_core::Memory;
+use gb_core::CpuBus;
 
 const IE_ADDR: u16 = 0xFFFF;
 const IF_ADDR: u16 = 0xFF0F;
 
-/// A flat 64 KiB memory: the test adapter for the CPU's `Memory` seam.
+/// A flat 64 KiB memory: the test adapter for the CPU's `CpuBus` seam. Its
+/// clocking methods are no-ops — opcode tests care about results and the cycle
+/// counts `step` returns, not real-time peripheral advancement.
 struct FlatMem {
     ram: [u8; 0x10000],
 }
 
-impl Memory for FlatMem {
-    fn read(&self, addr: u16) -> u8 {
+impl CpuBus for FlatMem {
+    fn read(&mut self, addr: u16) -> u8 {
         self.ram[addr as usize]
     }
     fn write(&mut self, addr: u16, val: u8) {
         self.ram[addr as usize] = val;
+    }
+    fn idle(&mut self) {}
+    fn peek(&self, addr: u16) -> u8 {
+        self.ram[addr as usize]
+    }
+    fn poke(&mut self, addr: u16, val: u8) {
+        self.ram[addr as usize] = val;
+    }
+    fn elapsed(&self) -> u64 {
+        0
     }
 }
 

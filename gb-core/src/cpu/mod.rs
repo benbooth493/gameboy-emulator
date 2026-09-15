@@ -2,7 +2,7 @@
 
 pub mod registers;
 
-use crate::memory::Memory;
+use crate::memory::CpuBus;
 use registers::{Registers, FLAG_C, FLAG_H, FLAG_N, FLAG_Z};
 
 /// Interrupt vector for each IF/IE bit, lowest bit first (highest priority).
@@ -34,77 +34,91 @@ impl Cpu {
 
     /// Interrupts that are both enabled (IE) and requested (IF), read through
     /// the memory seam. Bit set = pending.
-    fn pending_interrupts(&self, mem: &impl Memory) -> u8 {
-        mem.read(IE_ADDR) & mem.read(IF_ADDR) & 0x1F
+    fn pending_interrupts(&self, mem: &impl CpuBus) -> u8 {
+        // Non-clocking: the pending check is free, it doesn't consume a cycle.
+        mem.peek(IE_ADDR) & mem.peek(IF_ADDR) & 0x1F
     }
 
-    /// Execute one instruction (or service an interrupt / idle in HALT).
-    /// Returns T-cycles consumed. The caller ticks the bus.
-    pub fn step<M: Memory>(&mut self, mem: &mut M) -> u32 {
+    /// Execute one instruction (or service an interrupt / idle in HALT),
+    /// driving the bus one M-cycle per memory access or internal cycle.
+    /// Returns the total T-cycles consumed.
+    pub fn step<M: CpuBus>(&mut self, mem: &mut M) -> u32 {
+        let start = mem.elapsed();
         // EI takes effect after the following instruction.
         let enable_ime_after = self.ei_pending;
 
         let pending = self.pending_interrupts(mem);
-        if self.ime {
-            if pending != 0 {
-                // Highest priority = lowest set bit.
-                let bit = pending.trailing_zeros() as u8;
-                self.halted = false;
-                self.ime = false;
-                self.ei_pending = false;
-                // Acknowledge: clear this bit in IF.
-                let if_val = mem.read(IF_ADDR) & !(1 << bit);
-                mem.write(IF_ADDR, if_val);
-                self.push16(mem, self.regs.pc);
-                self.regs.pc = VECTORS[bit as usize];
-                return 20;
-            }
-        } else if self.halted && pending != 0 {
-            // Wake from HALT without servicing.
+        let total = if self.ime && pending != 0 {
+            // Service the highest-priority (lowest bit) interrupt: 5 M-cycles.
+            let bit = pending.trailing_zeros() as u8;
             self.halted = false;
-        }
-
-        if self.halted {
-            return 4;
-        }
-
-        let opcode = self.fetch8(mem);
-        if self.halt_bug {
-            // PC failed to increment for this fetch.
-            self.regs.pc = self.regs.pc.wrapping_sub(1);
-            self.halt_bug = false;
-        }
-        let cycles = self.execute(opcode, mem);
-
-        if enable_ime_after && self.ei_pending {
-            self.ime = true;
+            self.ime = false;
             self.ei_pending = false;
+            // Acknowledge (clear the IF bit) without consuming a cycle.
+            let if_val = mem.peek(IF_ADDR) & !(1 << bit);
+            mem.poke(IF_ADDR, if_val);
+            mem.idle(); // two wait states before the push
+            mem.idle();
+            self.push16(mem, self.regs.pc); // internal + two stack writes
+            self.regs.pc = VECTORS[bit as usize];
+            20
+        } else {
+            if self.halted && pending != 0 {
+                self.halted = false; // wake from HALT without servicing
+            }
+            if self.halted {
+                4
+            } else {
+                let opcode = self.fetch8(mem);
+                if self.halt_bug {
+                    // PC failed to increment for this fetch.
+                    self.regs.pc = self.regs.pc.wrapping_sub(1);
+                    self.halt_bug = false;
+                }
+                let cycles = self.execute(opcode, mem);
+                if enable_ime_after && self.ei_pending {
+                    self.ime = true;
+                    self.ei_pending = false;
+                }
+                cycles
+            }
+        };
+
+        // Account for any internal cycles the memory accesses didn't already
+        // clock (idle time with no access), so the machine advances by exactly
+        // `total` T-cycles for this instruction.
+        let done = (mem.elapsed() - start) as u32;
+        let mut remaining = total.saturating_sub(done);
+        while remaining >= 4 {
+            mem.idle();
+            remaining -= 4;
         }
-        cycles
+        total
     }
 
     // ---- memory helpers ----
 
-    fn fetch8(&mut self, mem: &mut impl Memory) -> u8 {
+    fn fetch8(&mut self, mem: &mut impl CpuBus) -> u8 {
         let v = mem.read(self.regs.pc);
         self.regs.pc = self.regs.pc.wrapping_add(1);
         v
     }
 
-    fn fetch16(&mut self, mem: &mut impl Memory) -> u16 {
+    fn fetch16(&mut self, mem: &mut impl CpuBus) -> u16 {
         let lo = self.fetch8(mem) as u16;
         let hi = self.fetch8(mem) as u16;
         hi << 8 | lo
     }
 
-    fn push16(&mut self, mem: &mut impl Memory, v: u16) {
+    fn push16(&mut self, mem: &mut impl CpuBus, v: u16) {
+        mem.idle(); // internal cycle before the stack writes (PUSH/CALL/RST/INT)
         self.regs.sp = self.regs.sp.wrapping_sub(1);
         mem.write(self.regs.sp, (v >> 8) as u8);
         self.regs.sp = self.regs.sp.wrapping_sub(1);
         mem.write(self.regs.sp, v as u8);
     }
 
-    fn pop16(&mut self, mem: &mut impl Memory) -> u16 {
+    fn pop16(&mut self, mem: &mut impl CpuBus) -> u16 {
         let lo = mem.read(self.regs.sp) as u16;
         self.regs.sp = self.regs.sp.wrapping_add(1);
         let hi = mem.read(self.regs.sp) as u16;
@@ -114,7 +128,7 @@ impl Cpu {
 
     // ---- 8-bit operand access by index (B,C,D,E,H,L,(HL),A) ----
 
-    fn get_r8(&mut self, idx: u8, mem: &mut impl Memory) -> u8 {
+    fn get_r8(&mut self, idx: u8, mem: &mut impl CpuBus) -> u8 {
         match idx {
             0 => self.regs.b,
             1 => self.regs.c,
@@ -127,7 +141,7 @@ impl Cpu {
         }
     }
 
-    fn set_r8(&mut self, idx: u8, val: u8, mem: &mut impl Memory) {
+    fn set_r8(&mut self, idx: u8, val: u8, mem: &mut impl CpuBus) {
         match idx {
             0 => self.regs.b = val,
             1 => self.regs.c = val,
@@ -213,7 +227,7 @@ impl Cpu {
         self.regs.set_hl(r);
     }
 
-    fn add_sp_e8(&mut self, mem: &mut impl Memory) -> u16 {
+    fn add_sp_e8(&mut self, mem: &mut impl CpuBus) -> u16 {
         let e = self.fetch8(mem) as i8 as i16 as u16;
         let sp = self.regs.sp;
         self.regs.f = 0;
@@ -304,7 +318,7 @@ impl Cpu {
 
     // ---- dispatch ----
 
-    fn execute(&mut self, opcode: u8, mem: &mut impl Memory) -> u32 {
+    fn execute(&mut self, opcode: u8, mem: &mut impl CpuBus) -> u32 {
         match opcode {
             0x00 => 4, // NOP
             0x10 => {
@@ -553,7 +567,7 @@ impl Cpu {
         }
     }
 
-    fn execute_cb(&mut self, mem: &mut impl Memory) -> u32 {
+    fn execute_cb(&mut self, mem: &mut impl CpuBus) -> u32 {
         let op = self.fetch8(mem);
         let idx = op & 7;
         let v = self.get_r8(idx, mem);

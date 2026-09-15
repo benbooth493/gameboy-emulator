@@ -1,6 +1,8 @@
 //! The emulator application: game screen, input, audio pump and the
 //! built-in debugger (registers, disassembly, memory, breakpoints, trace).
 
+use std::path::{Path, PathBuf};
+
 use eframe::egui;
 use gb_core::cpu::registers::{FLAG_C, FLAG_H, FLAG_N, FLAG_Z};
 use gb_core::disasm::disassemble;
@@ -8,7 +10,11 @@ use gb_core::{Button, Cartridge, GameBoy, SCREEN_H, SCREEN_W};
 
 use crate::audio::Audio;
 use crate::pacing::{Clock, Pacer, GB_FPS};
+use crate::saves;
 use crate::screen::{ScreenCallback, ScreenRenderer};
+
+/// Flush battery RAM this long after the last write settles.
+const AUTOSAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub struct EmulatorApp {
     gb: Option<GameBoy>,
@@ -26,6 +32,14 @@ pub struct EmulatorApp {
     disasm_base: u16,
     last_update: Option<std::time::Instant>,
     pacer: Pacer,
+    /// Where to persist battery RAM for the loaded ROM, if it has a battery.
+    save_path: Option<PathBuf>,
+    /// Battery RAM has changed since the last flush.
+    unsaved_ram: bool,
+    /// When the most recent battery-RAM write happened (for debounced saving).
+    last_ram_change: Option<std::time::Instant>,
+    /// Set by the debugger panel's "Save now" button; handled after the panel.
+    save_requested: bool,
     /// Pending result from the async ROM-picker dialog.
     rom_rx: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
 }
@@ -64,30 +78,106 @@ impl EmulatorApp {
             follow_pc: true,
             disasm_base: 0x0100,
             last_update: None,
+            save_path: None,
+            unsaved_ram: false,
+            last_ram_change: None,
+            save_requested: false,
             rom_rx: None,
         };
         if let Some(path) = rom_path {
-            app.load_rom_path(&path);
+            app.load_rom_path(Path::new(&path));
         }
         app
     }
 
-    fn load_rom_path(&mut self, path: &str) {
+    fn load_rom_path(&mut self, path: &Path) {
         match std::fs::read(path) {
-            Ok(bytes) => self.load_rom_bytes(bytes),
-            Err(e) => self.status = format!("Failed to read {path}: {e}"),
+            Ok(bytes) => self.load_rom_bytes(bytes, Some(path.to_path_buf())),
+            Err(e) => self.status = format!("Failed to read {}: {e}", path.display()),
         }
     }
 
-    fn load_rom_bytes(&mut self, bytes: Vec<u8>) {
+    fn load_rom_bytes(&mut self, bytes: Vec<u8>, path: Option<PathBuf>) {
+        // Persist the outgoing game before swapping cartridges.
+        self.flush_save();
         match Cartridge::from_rom(bytes) {
-            Ok(cart) => {
+            Ok(mut cart) => {
                 self.status = format!("Running: {}", cart.title);
+                // Restore battery RAM from a save file, if any.
+                self.save_path = match (&path, cart.has_battery()) {
+                    (Some(p), true) => Some(saves::save_path_for(p)),
+                    _ => None,
+                };
+                if let Some(sav) = &self.save_path {
+                    if let Some(data) = saves::load(sav) {
+                        cart.load_ram(&data);
+                    }
+                }
+                self.unsaved_ram = false;
+                self.last_ram_change = None;
+
                 let mut gb = GameBoy::new(cart);
                 gb.bus.apu.set_sample_rate(self.audio.sample_rate);
                 self.gb = Some(gb);
             }
             Err(e) => self.status = format!("Bad ROM: {e}"),
+        }
+    }
+
+    /// Note battery-RAM changes and flush a save once writes have settled.
+    fn autosave_tick(&mut self) {
+        let now = std::time::Instant::now();
+        let dirty = match self.gb.as_mut() {
+            Some(gb) => gb.bus.cart.take_ram_dirty(),
+            None => return,
+        };
+        if dirty {
+            self.unsaved_ram = true;
+            self.last_ram_change = Some(now);
+        }
+        if std::env::var_os("GBEM_SAVE_DEBUG").is_some() && (dirty || self.unsaved_ram) {
+            eprintln!(
+                "[save] dirty={dirty} unsaved={} save_path={:?}",
+                self.unsaved_ram, self.save_path
+            );
+        }
+        if self.unsaved_ram {
+            if let Some(t) = self.last_ram_change {
+                if now.duration_since(t) >= AUTOSAVE_DEBOUNCE {
+                    self.flush_save();
+                }
+            }
+        }
+    }
+
+    /// Write battery RAM to disk if there is unsaved data and a save path.
+    fn flush_save(&mut self) {
+        if !self.unsaved_ram {
+            return;
+        }
+        let Some(path) = self.save_path.clone() else { return };
+        let Some(gb) = self.gb.as_ref() else { return };
+        let result = saves::write(&path, gb.bus.cart.ram());
+        match result {
+            Ok(()) => self.unsaved_ram = false,
+            Err(e) => self.status = format!("Save failed: {e}"),
+        }
+    }
+
+    /// Explicit "Save now": write battery RAM even if nothing changed.
+    fn save_now(&mut self) {
+        let Some(path) = self.save_path.clone() else {
+            self.status = "This ROM has no battery save".into();
+            return;
+        };
+        let Some(gb) = self.gb.as_ref() else { return };
+        let result = saves::write(&path, gb.bus.cart.ram());
+        match result {
+            Ok(()) => {
+                self.unsaved_ram = false;
+                self.status = format!("Saved to {}", path.display());
+            }
+            Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
 
@@ -217,6 +307,13 @@ impl EmulatorApp {
                         .clicked()
                     {
                         gb.step_frame();
+                    }
+                    if ui
+                        .add_enabled(self.save_path.is_some(), egui::Button::new("💾 Save now"))
+                        .on_hover_text("Write battery RAM to the .sav file")
+                        .clicked()
+                    {
+                        self.save_requested = true;
                     }
                 });
                 ui.separator();
@@ -385,7 +482,7 @@ impl eframe::App for EmulatorApp {
             match rx.try_recv() {
                 Ok(Some(path)) => {
                     self.rom_rx = None;
-                    self.load_rom_path(&path.display().to_string());
+                    self.load_rom_path(&path);
                 }
                 Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.rom_rx = None;
@@ -398,9 +495,9 @@ impl eframe::App for EmulatorApp {
         let dropped: Vec<_> = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped {
             if let Some(path) = file.path {
-                self.load_rom_path(&path.display().to_string());
+                self.load_rom_path(&path);
             } else if let Some(bytes) = file.bytes {
-                self.load_rom_bytes(bytes.to_vec());
+                self.load_rom_bytes(bytes.to_vec(), None);
             }
         }
 
@@ -434,9 +531,14 @@ impl eframe::App for EmulatorApp {
 
         self.handle_input(ctx);
         self.run_emulation();
+        self.autosave_tick();
 
         if self.show_debugger {
             self.debugger_ui(ctx);
+        }
+        if self.save_requested {
+            self.save_requested = false;
+            self.save_now();
         }
 
         egui::CentralPanel::default()
@@ -448,5 +550,10 @@ impl eframe::App for EmulatorApp {
             });
 
         ctx.request_repaint();
+    }
+
+    fn on_exit(&mut self) {
+        // Final flush so progress since the last debounced save isn't lost.
+        self.flush_save();
     }
 }

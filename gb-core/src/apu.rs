@@ -55,15 +55,96 @@ impl Envelope {
     }
 }
 
+/// The length counter shared by all four channels: when enabled it counts
+/// down on each frame-sequencer length clock and disables its channel at zero.
+/// `max` is 64 for the pulse and noise channels, 256 for the wave channel.
+#[derive(Clone)]
+struct LengthCounter {
+    counter: u16,
+    enabled: bool,
+    max: u16,
+}
+
+impl LengthCounter {
+    fn new(max: u16) -> Self {
+        LengthCounter { counter: 0, enabled: false, max }
+    }
+
+    /// NRx1 write: remaining length = max - written value.
+    fn load(&mut self, written: u16) {
+        self.counter = self.max - written;
+    }
+
+    /// NRx4 bit 6.
+    fn set_enable(&mut self, enable: bool) {
+        self.enabled = enable;
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// On trigger a zero counter reloads to its maximum.
+    fn trigger(&mut self) {
+        if self.counter == 0 {
+            self.counter = self.max;
+        }
+    }
+
+    /// Advance one length step; returns true when the channel should be
+    /// disabled (the counter reached zero this step).
+    fn clock(&mut self) -> bool {
+        if self.enabled && self.counter > 0 {
+            self.counter -= 1;
+            if self.counter == 0 {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// The frequency timer shared by all channels: a down-counter reloaded to a
+/// channel-supplied period. `step` advances it by `cycles` T-cycles and reports
+/// how many times it expired, so each channel can advance its own waveform
+/// (duty step, wave position, LFSR shift) that many times.
 #[derive(Default, Clone)]
+struct FrequencyTimer {
+    counter: u32,
+}
+
+impl FrequencyTimer {
+    /// Set the counter to `period` (on channel trigger).
+    fn reload_to(&mut self, period: u32) {
+        self.counter = period;
+    }
+
+    fn step(&mut self, cycles: u32, period: u32) -> u32 {
+        let mut expirations = 0;
+        let mut c = cycles;
+        while c > 0 {
+            let step = c.min(self.counter.max(1));
+            if self.counter <= step {
+                self.counter = period;
+                expirations += 1;
+                c -= step;
+            } else {
+                self.counter -= step;
+                c = 0;
+            }
+        }
+        expirations
+    }
+}
+
+#[derive(Clone)]
 struct Pulse {
     enabled: bool,
     duty: u8,
     duty_pos: usize,
     freq: u16, // 11-bit
-    freq_timer: u32,
-    length: u16,
-    length_enable: bool,
+    timer: FrequencyTimer,
+    length: LengthCounter,
     envelope: Envelope,
     // sweep (channel 1 only)
     sweep_period: u8,
@@ -74,13 +155,36 @@ struct Pulse {
     sweep_enabled: bool,
 }
 
+impl Default for Pulse {
+    fn default() -> Self {
+        Pulse {
+            enabled: false,
+            duty: 0,
+            duty_pos: 0,
+            freq: 0,
+            timer: FrequencyTimer::default(),
+            length: LengthCounter::new(64),
+            envelope: Envelope::default(),
+            sweep_period: 0,
+            sweep_up: false,
+            sweep_shift: 0,
+            sweep_timer: 0,
+            sweep_shadow: 0,
+            sweep_enabled: false,
+        }
+    }
+}
+
 impl Pulse {
+    /// Frequency-timer period in T-cycles for the current frequency.
+    fn period(&self) -> u32 {
+        (2048 - self.freq as u32) * 4
+    }
+
     fn trigger(&mut self, has_sweep: bool) {
         self.enabled = self.envelope.dac_on();
-        if self.length == 0 {
-            self.length = 64;
-        }
-        self.freq_timer = (2048 - self.freq as u32) * 4;
+        self.length.trigger();
+        self.timer.reload_to(self.period());
         self.envelope.trigger();
         if has_sweep {
             self.sweep_shadow = self.freq;
@@ -123,26 +227,15 @@ impl Pulse {
     }
 
     fn clock_length(&mut self) {
-        if self.length_enable && self.length > 0 {
-            self.length -= 1;
-            if self.length == 0 {
-                self.enabled = false;
-            }
+        if self.length.clock() {
+            self.enabled = false;
         }
     }
 
     fn tick(&mut self, cycles: u32) {
-        let mut c = cycles;
-        while c > 0 {
-            let step = c.min(self.freq_timer.max(1));
-            if self.freq_timer <= step {
-                self.freq_timer = (2048 - self.freq as u32) * 4;
-                self.duty_pos = (self.duty_pos + 1) % 8;
-                c -= step;
-            } else {
-                self.freq_timer -= step;
-                c = 0;
-            }
+        let expirations = self.timer.step(cycles, self.period());
+        for _ in 0..expirations {
+            self.duty_pos = (self.duty_pos + 1) % 8;
         }
     }
 
@@ -157,54 +250,59 @@ impl Pulse {
 }
 
 #[derive(Clone)]
-#[derive(Default)]
 struct Wave {
     enabled: bool,
     dac_on: bool,
     volume_shift: u8, // 0=mute,1=100%,2=50%,3=25% encoded as shifts 4,0,1,2
     freq: u16,
-    freq_timer: u32,
-    length: u16,
-    length_enable: bool,
+    timer: FrequencyTimer,
+    length: LengthCounter,
     pos: usize,
     pub table: [u8; 16],
     sample: u8,
 }
 
+impl Default for Wave {
+    fn default() -> Self {
+        Wave {
+            enabled: false,
+            dac_on: false,
+            volume_shift: 0,
+            freq: 0,
+            timer: FrequencyTimer::default(),
+            length: LengthCounter::new(256),
+            pos: 0,
+            table: [0; 16],
+            sample: 0,
+        }
+    }
+}
 
 impl Wave {
+    /// Frequency-timer period in T-cycles for the current frequency.
+    fn period(&self) -> u32 {
+        (2048 - self.freq as u32) * 2
+    }
+
     fn trigger(&mut self) {
         self.enabled = self.dac_on;
-        if self.length == 0 {
-            self.length = 256;
-        }
-        self.freq_timer = (2048 - self.freq as u32) * 2;
+        self.length.trigger();
+        self.timer.reload_to(self.period());
         self.pos = 0;
     }
 
     fn clock_length(&mut self) {
-        if self.length_enable && self.length > 0 {
-            self.length -= 1;
-            if self.length == 0 {
-                self.enabled = false;
-            }
+        if self.length.clock() {
+            self.enabled = false;
         }
     }
 
     fn tick(&mut self, cycles: u32) {
-        let mut c = cycles;
-        while c > 0 {
-            let step = c.min(self.freq_timer.max(1));
-            if self.freq_timer <= step {
-                self.freq_timer = (2048 - self.freq as u32) * 2;
-                self.pos = (self.pos + 1) % 32;
-                let byte = self.table[self.pos / 2];
-                self.sample = if self.pos.is_multiple_of(2) { byte >> 4 } else { byte & 0x0F };
-                c -= step;
-            } else {
-                self.freq_timer -= step;
-                c = 0;
-            }
+        let expirations = self.timer.step(cycles, self.period());
+        for _ in 0..expirations {
+            self.pos = (self.pos + 1) % 32;
+            let byte = self.table[self.pos / 2];
+            self.sample = if self.pos.is_multiple_of(2) { byte >> 4 } else { byte & 0x0F };
         }
     }
 
@@ -223,17 +321,31 @@ impl Wave {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct Noise {
     enabled: bool,
-    length: u16,
-    length_enable: bool,
+    length: LengthCounter,
     envelope: Envelope,
     shift: u8,
     width7: bool,
     divisor_code: u8,
-    freq_timer: u32,
+    timer: FrequencyTimer,
     lfsr: u16,
+}
+
+impl Default for Noise {
+    fn default() -> Self {
+        Noise {
+            enabled: false,
+            length: LengthCounter::new(64),
+            envelope: Envelope::default(),
+            shift: 0,
+            width7: false,
+            divisor_code: 0,
+            timer: FrequencyTimer::default(),
+            lfsr: 0,
+        }
+    }
 }
 
 impl Noise {
@@ -247,38 +359,25 @@ impl Noise {
 
     fn trigger(&mut self) {
         self.enabled = self.envelope.dac_on();
-        if self.length == 0 {
-            self.length = 64;
-        }
-        self.freq_timer = self.period();
+        self.length.trigger();
+        self.timer.reload_to(self.period());
         self.envelope.trigger();
         self.lfsr = 0x7FFF;
     }
 
     fn clock_length(&mut self) {
-        if self.length_enable && self.length > 0 {
-            self.length -= 1;
-            if self.length == 0 {
-                self.enabled = false;
-            }
+        if self.length.clock() {
+            self.enabled = false;
         }
     }
 
     fn tick(&mut self, cycles: u32) {
-        let mut c = cycles;
-        while c > 0 {
-            let step = c.min(self.freq_timer.max(1));
-            if self.freq_timer <= step {
-                self.freq_timer = self.period();
-                let xor = (self.lfsr & 1) ^ ((self.lfsr >> 1) & 1);
-                self.lfsr = (self.lfsr >> 1) | (xor << 14);
-                if self.width7 {
-                    self.lfsr = (self.lfsr & !(1 << 6)) | (xor << 6);
-                }
-                c -= step;
-            } else {
-                self.freq_timer -= step;
-                c = 0;
+        let expirations = self.timer.step(cycles, self.period());
+        for _ in 0..expirations {
+            let xor = (self.lfsr & 1) ^ ((self.lfsr >> 1) & 1);
+            self.lfsr = (self.lfsr >> 1) | (xor << 14);
+            if self.width7 {
+                self.lfsr = (self.lfsr & !(1 << 6)) | (xor << 6);
             }
         }
     }
@@ -347,20 +446,20 @@ impl Apu {
             0xFF11 => (self.ch1.duty << 6) | 0x3F,
             0xFF12 => self.ch1.envelope.read(),
             0xFF13 => 0xFF,
-            0xFF14 => 0xBF | (if self.ch1.length_enable { 0x40 } else { 0 }),
+            0xFF14 => 0xBF | (if self.ch1.length.is_enabled() { 0x40 } else { 0 }),
             0xFF16 => (self.ch2.duty << 6) | 0x3F,
             0xFF17 => self.ch2.envelope.read(),
             0xFF18 => 0xFF,
-            0xFF19 => 0xBF | (if self.ch2.length_enable { 0x40 } else { 0 }),
+            0xFF19 => 0xBF | (if self.ch2.length.is_enabled() { 0x40 } else { 0 }),
             0xFF1A => 0x7F | (if self.ch3.dac_on { 0x80 } else { 0 }),
             0xFF1B => 0xFF,
             0xFF1C => 0x9F | (self.ch3.volume_shift << 5),
             0xFF1D => 0xFF,
-            0xFF1E => 0xBF | (if self.ch3.length_enable { 0x40 } else { 0 }),
+            0xFF1E => 0xBF | (if self.ch3.length.is_enabled() { 0x40 } else { 0 }),
             0xFF20 => 0xFF,
             0xFF21 => self.ch4.envelope.read(),
             0xFF22 => (self.ch4.shift << 4) | (if self.ch4.width7 { 8 } else { 0 }) | self.ch4.divisor_code,
-            0xFF23 => 0xBF | (if self.ch4.length_enable { 0x40 } else { 0 }),
+            0xFF23 => 0xBF | (if self.ch4.length.is_enabled() { 0x40 } else { 0 }),
             0xFF24 => self.nr50,
             0xFF25 => self.nr51,
             0xFF26 => {
@@ -399,7 +498,7 @@ impl Apu {
             }
             0xFF11 => {
                 self.ch1.duty = val >> 6;
-                self.ch1.length = 64 - (val & 0x3F) as u16;
+                self.ch1.length.load((val & 0x3F) as u16);
             }
             0xFF12 => {
                 self.ch1.envelope.write(val);
@@ -410,14 +509,14 @@ impl Apu {
             0xFF13 => self.ch1.freq = (self.ch1.freq & 0x700) | val as u16,
             0xFF14 => {
                 self.ch1.freq = (self.ch1.freq & 0xFF) | ((val as u16 & 7) << 8);
-                self.ch1.length_enable = val & 0x40 != 0;
+                self.ch1.length.set_enable(val & 0x40 != 0);
                 if val & 0x80 != 0 {
                     self.ch1.trigger(true);
                 }
             }
             0xFF16 => {
                 self.ch2.duty = val >> 6;
-                self.ch2.length = 64 - (val & 0x3F) as u16;
+                self.ch2.length.load((val & 0x3F) as u16);
             }
             0xFF17 => {
                 self.ch2.envelope.write(val);
@@ -428,7 +527,7 @@ impl Apu {
             0xFF18 => self.ch2.freq = (self.ch2.freq & 0x700) | val as u16,
             0xFF19 => {
                 self.ch2.freq = (self.ch2.freq & 0xFF) | ((val as u16 & 7) << 8);
-                self.ch2.length_enable = val & 0x40 != 0;
+                self.ch2.length.set_enable(val & 0x40 != 0);
                 if val & 0x80 != 0 {
                     self.ch2.trigger(false);
                 }
@@ -439,17 +538,17 @@ impl Apu {
                     self.ch3.enabled = false;
                 }
             }
-            0xFF1B => self.ch3.length = 256 - val as u16,
+            0xFF1B => self.ch3.length.load(val as u16),
             0xFF1C => self.ch3.volume_shift = (val >> 5) & 3,
             0xFF1D => self.ch3.freq = (self.ch3.freq & 0x700) | val as u16,
             0xFF1E => {
                 self.ch3.freq = (self.ch3.freq & 0xFF) | ((val as u16 & 7) << 8);
-                self.ch3.length_enable = val & 0x40 != 0;
+                self.ch3.length.set_enable(val & 0x40 != 0);
                 if val & 0x80 != 0 {
                     self.ch3.trigger();
                 }
             }
-            0xFF20 => self.ch4.length = 64 - (val & 0x3F) as u16,
+            0xFF20 => self.ch4.length.load((val & 0x3F) as u16),
             0xFF21 => {
                 self.ch4.envelope.write(val);
                 if !self.ch4.envelope.dac_on() {
@@ -462,7 +561,7 @@ impl Apu {
                 self.ch4.divisor_code = val & 7;
             }
             0xFF23 => {
-                self.ch4.length_enable = val & 0x40 != 0;
+                self.ch4.length.set_enable(val & 0x40 != 0);
                 if val & 0x80 != 0 {
                     self.ch4.trigger();
                 }
@@ -566,6 +665,66 @@ impl Apu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn length_counter_disables_at_zero() {
+        let mut lc = LengthCounter::new(64);
+        lc.load(63); // remaining = 1
+        lc.set_enable(true);
+        assert!(lc.clock(), "counter should hit zero and signal disable");
+        assert!(!lc.clock(), "no further disable once at zero");
+    }
+
+    #[test]
+    fn length_counter_only_clocks_when_enabled() {
+        let mut lc = LengthCounter::new(64);
+        lc.load(63);
+        // Not enabled: clocking is a no-op.
+        assert!(!lc.clock());
+        lc.set_enable(true);
+        assert!(lc.clock());
+    }
+
+    #[test]
+    fn length_counter_trigger_reloads_only_when_zero() {
+        let mut lc = LengthCounter::new(64);
+        lc.trigger(); // was zero -> reloads to max
+        lc.set_enable(true);
+        // 64 clocks to reach zero.
+        for _ in 0..63 {
+            assert!(!lc.clock());
+        }
+        assert!(lc.clock());
+
+        let mut lc = LengthCounter::new(256);
+        lc.load(200); // remaining 56
+        lc.trigger(); // non-zero -> unchanged
+        lc.set_enable(true);
+        for _ in 0..55 {
+            assert!(!lc.clock());
+        }
+        assert!(lc.clock());
+    }
+
+    #[test]
+    fn frequency_timer_counts_expirations() {
+        let mut t = FrequencyTimer::default();
+        t.reload_to(4);
+        // 4 cycles per expiry: 16 cycles -> 4 expirations.
+        assert_eq!(t.step(16, 4), 4);
+        // Partial: 2 more cycles, none yet; 2 more completes one.
+        assert_eq!(t.step(2, 4), 0);
+        assert_eq!(t.step(2, 4), 1);
+    }
+
+    #[test]
+    fn frequency_timer_uses_period_at_reload() {
+        let mut t = FrequencyTimer::default();
+        t.reload_to(8);
+        // First expiry after 8 cycles, then reloads to the period passed in.
+        assert_eq!(t.step(8, 8), 1);
+        assert_eq!(t.step(8, 8), 1);
+    }
 
     #[test]
     fn produces_samples_at_requested_rate() {

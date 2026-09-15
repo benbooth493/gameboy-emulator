@@ -12,7 +12,7 @@ pub const CYCLES_PER_FRAME: u32 = 70224;
 pub struct GameBoy {
     pub cpu: Cpu,
     pub bus: Bus,
-    pub debugger: Debugger,
+    debugger: Debugger,
     pub cycles: u64,
 }
 
@@ -38,7 +38,7 @@ impl GameBoy {
     /// Run until a full frame is rendered, a breakpoint is hit, or the
     /// debugger pauses. Returns the reason the run stopped, if any.
     pub fn run_frame(&mut self) -> Option<StopReason> {
-        if self.debugger.paused {
+        if self.debugger.is_paused() {
             return Some(StopReason::Paused);
         }
         self.bus.ppu.frame_ready = false;
@@ -46,17 +46,68 @@ impl GameBoy {
         while !self.bus.ppu.frame_ready && budget > 0 {
             budget = budget.saturating_sub(self.step());
             if self.debugger.has_breakpoint(self.cpu.regs.pc) {
-                self.debugger.paused = true;
+                self.debugger.set_paused(true);
                 return Some(StopReason::Breakpoint(self.cpu.regs.pc));
             }
         }
         None
     }
 
-    /// Single-step one instruction while paused.
-    pub fn debug_step(&mut self) -> StopReason {
+    // ---- run control ----
+
+    pub fn is_paused(&self) -> bool {
+        self.debugger.is_paused()
+    }
+
+    pub fn pause(&mut self) {
+        self.debugger.set_paused(true);
+    }
+
+    pub fn resume(&mut self) {
+        self.debugger.set_paused(false);
+    }
+
+    pub fn toggle_pause(&mut self) {
+        let p = self.debugger.is_paused();
+        self.debugger.set_paused(!p);
+    }
+
+    /// Execute exactly one instruction (regardless of the pause flag).
+    pub fn step_instruction(&mut self) -> StopReason {
         self.step();
         StopReason::Step
+    }
+
+    /// Run a single frame even while paused, leaving the machine paused after.
+    pub fn step_frame(&mut self) -> Option<StopReason> {
+        let was_paused = self.debugger.is_paused();
+        self.debugger.set_paused(false);
+        let stop = self.run_frame();
+        // A breakpoint mid-frame already re-paused us; otherwise restore state.
+        if !matches!(stop, Some(StopReason::Breakpoint(_))) {
+            self.debugger.set_paused(was_paused);
+        }
+        stop
+    }
+
+    // ---- breakpoints & trace (read-only views for a UI) ----
+
+    pub fn toggle_breakpoint(&mut self, addr: u16) {
+        self.debugger.toggle_breakpoint(addr);
+    }
+
+    pub fn has_breakpoint(&self, addr: u16) -> bool {
+        self.debugger.has_breakpoint(addr)
+    }
+
+    /// Breakpoint addresses, ascending.
+    pub fn breakpoints(&self) -> Vec<u16> {
+        self.debugger.breakpoints()
+    }
+
+    /// Recently executed PCs, oldest first.
+    pub fn trace(&self) -> Vec<u16> {
+        self.debugger.trace()
     }
 
     pub fn framebuffer(&self) -> &[u8; SCREEN_W * SCREEN_H] {
@@ -89,28 +140,59 @@ mod tests {
     fn breakpoint_stops_run() {
         // NOP; NOP; JR -2
         let mut gb = gb_with(&[0x00, 0x00, 0x18, 0xFE]);
-        gb.debugger.toggle_breakpoint(0x0102);
+        gb.toggle_breakpoint(0x0102);
         let stop = gb.run_frame();
         assert_eq!(stop, Some(StopReason::Breakpoint(0x0102)));
         assert_eq!(gb.cpu.regs.pc, 0x0102);
-        assert!(gb.debugger.paused);
+        assert!(gb.is_paused());
     }
 
     #[test]
     fn paused_machine_does_not_run() {
         let mut gb = gb_with(&[0x00]);
-        gb.debugger.paused = true;
+        gb.pause();
         let pc = gb.cpu.regs.pc;
         assert_eq!(gb.run_frame(), Some(StopReason::Paused));
         assert_eq!(gb.cpu.regs.pc, pc);
     }
 
     #[test]
-    fn debug_step_advances_one_instruction() {
+    fn step_instruction_advances_one_instruction() {
         let mut gb = gb_with(&[0x00, 0x00]);
-        gb.debugger.paused = true;
-        gb.debug_step();
+        gb.pause();
+        gb.step_instruction();
         assert_eq!(gb.cpu.regs.pc, 0x0101);
+    }
+
+    #[test]
+    fn step_frame_runs_one_frame_and_stays_paused() {
+        let mut gb = gb_with(&[0x18, 0xFE]); // spin
+        gb.pause();
+        let c0 = gb.cycles;
+        let stop = gb.step_frame();
+        assert!(stop.is_none());
+        assert!(gb.cycles > c0); // a frame's worth of work happened
+        assert!(gb.is_paused()); // ...and we're paused again
+    }
+
+    #[test]
+    fn step_frame_stops_and_stays_paused_on_breakpoint() {
+        let mut gb = gb_with(&[0x00, 0x00, 0x18, 0xFE]);
+        gb.pause();
+        gb.toggle_breakpoint(0x0102);
+        let stop = gb.step_frame();
+        assert_eq!(stop, Some(StopReason::Breakpoint(0x0102)));
+        assert!(gb.is_paused());
+    }
+
+    #[test]
+    fn toggle_pause_flips_state() {
+        let mut gb = gb_with(&[0x00]);
+        assert!(!gb.is_paused());
+        gb.toggle_pause();
+        assert!(gb.is_paused());
+        gb.toggle_pause();
+        assert!(!gb.is_paused());
     }
 
     #[test]

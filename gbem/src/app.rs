@@ -122,17 +122,17 @@ impl EmulatorApp {
                 }
             }
             if i.key_pressed(egui::Key::P) {
-                gb.debugger.paused = !gb.debugger.paused;
+                gb.toggle_pause();
             }
-            if i.key_pressed(egui::Key::N) && gb.debugger.paused {
-                gb.debug_step();
+            if i.key_pressed(egui::Key::N) && gb.is_paused() {
+                gb.step_instruction();
             }
         });
     }
 
     fn run_emulation(&mut self) {
         let Some(gb) = self.gb.as_mut() else { return };
-        if gb.debugger.paused {
+        if gb.is_paused() {
             self.last_update = None;
             self.pacer.reset();
             // Keep the debugger view of the framebuffer fresh while stepping.
@@ -201,23 +201,22 @@ impl EmulatorApp {
             .show(ctx, |ui| {
                 ui.heading("Debugger");
                 ui.horizontal(|ui| {
-                    let label = if gb.debugger.paused { "▶ Continue (P)" } else { "⏸ Pause (P)" };
+                    let paused = gb.is_paused();
+                    let label = if paused { "▶ Continue (P)" } else { "⏸ Pause (P)" };
                     if ui.button(label).clicked() {
-                        gb.debugger.paused = !gb.debugger.paused;
+                        gb.toggle_pause();
                     }
                     if ui
-                        .add_enabled(gb.debugger.paused, egui::Button::new("Step (N)"))
+                        .add_enabled(paused, egui::Button::new("Step (N)"))
                         .clicked()
                     {
-                        gb.debug_step();
+                        gb.step_instruction();
                     }
                     if ui
-                        .add_enabled(gb.debugger.paused, egui::Button::new("Step frame"))
+                        .add_enabled(paused, egui::Button::new("Step frame"))
                         .clicked()
                     {
-                        gb.debugger.paused = false;
-                        gb.run_frame();
-                        gb.debugger.paused = true;
+                        gb.step_frame();
                     }
                 });
                 ui.separator();
@@ -272,7 +271,7 @@ impl EmulatorApp {
                         for _ in 0..24 {
                             let (text, len) = disassemble(|a| gb.bus.read(a), addr);
                             let is_pc = addr == gb.cpu.regs.pc;
-                            let has_bp = gb.debugger.has_breakpoint(addr);
+                            let has_bp = gb.has_breakpoint(addr);
                             let marker = match (has_bp, is_pc) {
                                 (true, true) => "●▶",
                                 (true, false) => "● ",
@@ -291,7 +290,7 @@ impl EmulatorApp {
                                 }),
                             );
                             if resp.clicked() {
-                                gb.debugger.toggle_breakpoint(addr);
+                                gb.toggle_breakpoint(addr);
                             }
                             addr = addr.wrapping_add(len);
                         }
@@ -304,13 +303,12 @@ impl EmulatorApp {
                     if ui.button("Add/Remove").clicked() {
                         if let Ok(a) = u16::from_str_radix(self.bp_input.trim_start_matches("0x"), 16)
                         {
-                            gb.debugger.toggle_breakpoint(a);
+                            gb.toggle_breakpoint(a);
                         }
                     }
                 });
-                if !gb.debugger.breakpoints.is_empty() {
-                    let mut bps: Vec<u16> = gb.debugger.breakpoints.iter().copied().collect();
-                    bps.sort();
+                let bps = gb.breakpoints();
+                if !bps.is_empty() {
                     let list = bps
                         .iter()
                         .map(|b| format!("{b:04X}"))
@@ -355,7 +353,7 @@ impl EmulatorApp {
 
                 // Execution trace
                 ui.collapsing("Execution trace (last 16)", |ui| {
-                    let trace = gb.debugger.trace();
+                    let trace = gb.trace();
                     for pc in trace.iter().rev().take(16) {
                         let (text, _) = disassemble(|a| gb.bus.read(a), *pc);
                         ui.monospace(format!("{pc:04X}  {text}"));

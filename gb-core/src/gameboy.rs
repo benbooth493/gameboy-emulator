@@ -22,7 +22,7 @@ pub struct GameBoy {
 
 /// Save-state header magic and format version.
 const STATE_MAGIC: &[u8; 8] = b"GBEMSAVE";
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StateError {

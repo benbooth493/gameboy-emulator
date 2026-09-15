@@ -322,7 +322,8 @@ impl Cpu {
         match opcode {
             0x00 => 4, // NOP
             0x10 => {
-                // STOP: consume the padding byte.
+                // STOP: performs a CGB speed switch if KEY1 is armed.
+                mem.stop();
                 self.fetch8(mem);
                 4
             }

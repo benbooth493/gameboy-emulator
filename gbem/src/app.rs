@@ -40,6 +40,12 @@ pub struct EmulatorApp {
     last_ram_change: Option<std::time::Instant>,
     /// Set by the debugger panel's "Save now" button; handled after the panel.
     save_requested: bool,
+    /// Where to read/write the save state for the loaded ROM.
+    state_path: Option<PathBuf>,
+    /// Deferred save-state / load-state requests (from keys or panel buttons),
+    /// handled after the UI so they can borrow the whole app.
+    state_save_requested: bool,
+    state_load_requested: bool,
     /// Pending result from the async ROM-picker dialog.
     rom_rx: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
 }
@@ -82,6 +88,9 @@ impl EmulatorApp {
             unsaved_ram: false,
             last_ram_change: None,
             save_requested: false,
+            state_path: None,
+            state_save_requested: false,
+            state_load_requested: false,
             rom_rx: None,
         };
         if let Some(path) = rom_path {
@@ -108,6 +117,8 @@ impl EmulatorApp {
                     (Some(p), true) => Some(saves::save_path_for(p)),
                     _ => None,
                 };
+                // Save states work for any ROM, battery or not.
+                self.state_path = path.as_deref().map(saves::state_path_for);
                 if let Some(sav) = &self.save_path {
                     if let Some(data) = saves::load(sav) {
                         cart.load_ram(&data);
@@ -164,6 +175,34 @@ impl EmulatorApp {
         }
     }
 
+    /// Write a save state to `<rom>.state`.
+    fn save_state_file(&mut self) {
+        let Some(path) = self.state_path.clone() else {
+            self.status = "Load a ROM from a file to use save states".into();
+            return;
+        };
+        let Some(gb) = self.gb.as_ref() else { return };
+        let data = gb.save_state();
+        match saves::write(&path, &data) {
+            Ok(()) => self.status = format!("Saved state to {}", path.display()),
+            Err(e) => self.status = format!("Save state failed: {e}"),
+        }
+    }
+
+    /// Restore a save state from `<rom>.state`.
+    fn load_state_file(&mut self) {
+        let Some(path) = self.state_path.clone() else { return };
+        let Some(data) = saves::load(&path) else {
+            self.status = "No save state for this ROM".into();
+            return;
+        };
+        let Some(gb) = self.gb.as_mut() else { return };
+        match gb.load_state(&data) {
+            Ok(()) => self.status = "Loaded save state".into(),
+            Err(e) => self.status = format!("Load state failed: {e}"),
+        }
+    }
+
     /// Explicit "Save now": write battery RAM even if nothing changed.
     fn save_now(&mut self) {
         let Some(path) = self.save_path.clone() else {
@@ -216,6 +255,14 @@ impl EmulatorApp {
             }
             if i.key_pressed(egui::Key::N) && gb.is_paused() {
                 gb.step_instruction();
+            }
+            // Save state (F5) / load state (F9) — deferred so the handlers can
+            // borrow the whole app after input processing.
+            if i.key_pressed(egui::Key::F5) {
+                self.state_save_requested = true;
+            }
+            if i.key_pressed(egui::Key::F9) {
+                self.state_load_requested = true;
             }
         });
     }
@@ -314,6 +361,21 @@ impl EmulatorApp {
                         .clicked()
                     {
                         self.save_requested = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let has_state_path = self.state_path.is_some();
+                    if ui
+                        .add_enabled(has_state_path, egui::Button::new("Save state (F5)"))
+                        .clicked()
+                    {
+                        self.state_save_requested = true;
+                    }
+                    if ui
+                        .add_enabled(has_state_path, egui::Button::new("Load state (F9)"))
+                        .clicked()
+                    {
+                        self.state_load_requested = true;
                     }
                 });
                 ui.separator();
@@ -539,6 +601,14 @@ impl eframe::App for EmulatorApp {
         if self.save_requested {
             self.save_requested = false;
             self.save_now();
+        }
+        if self.state_save_requested {
+            self.state_save_requested = false;
+            self.save_state_file();
+        }
+        if self.state_load_requested {
+            self.state_load_requested = false;
+            self.load_state_file();
         }
 
         egui::CentralPanel::default()

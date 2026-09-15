@@ -8,6 +8,7 @@ use crate::joypad::Joypad;
 use crate::ppu::Ppu;
 use crate::timer::Timer;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Bus {
     pub cart: Cartridge,
     pub ppu: Ppu,
@@ -15,11 +16,15 @@ pub struct Bus {
     pub timer: Timer,
     pub joypad: Joypad,
     pub ints: Interrupts,
+    #[serde(with = "serde_big_array::BigArray")]
     pub wram: [u8; 0x2000],
+    #[serde(with = "serde_big_array::BigArray")]
     pub hram: [u8; 0x7F],
     serial_data: u8,
     serial_ctrl: u8,
     /// Bytes written to the serial port (handy for test ROMs like Blargg's).
+    /// A debug capture, not machine state — excluded from save states.
+    #[serde(skip)]
     pub serial_out: Vec<u8>,
     dma_src: u8,
     dma_countdown: u16, // remaining T-cycles of an active OAM DMA

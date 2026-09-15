@@ -15,6 +15,7 @@ pub enum Button {
 }
 
 #[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Joypad {
     select: u8,     // bits 4-5 of P1 as written by the game
     dpad: u8,       // pressed = 1 in our internal state

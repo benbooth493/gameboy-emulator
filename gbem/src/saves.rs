@@ -8,6 +8,11 @@ pub fn save_path_for(rom: &Path) -> PathBuf {
     rom.with_extension("sav")
 }
 
+/// The save-state path for a ROM: same location, `.state` extension.
+pub fn state_path_for(rom: &Path) -> PathBuf {
+    rom.with_extension("state")
+}
+
 /// Read a save file if it exists (returns `None` on any error).
 pub fn load(path: &Path) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
@@ -31,5 +36,10 @@ mod tests {
     #[test]
     fn save_path_adds_extension_when_missing() {
         assert_eq!(save_path_for(Path::new("rom")), PathBuf::from("rom.sav"));
+    }
+
+    #[test]
+    fn state_path_swaps_extension() {
+        assert_eq!(state_path_for(Path::new("/g/tetris.gb")), PathBuf::from("/g/tetris.state"));
     }
 }

@@ -5,6 +5,7 @@
 //! colour mapping is left to the frontend (the shader applies the DMG green).
 
 use crate::interrupts::{Interrupts, INT_STAT, INT_VBLANK};
+use serde_big_array::BigArray;
 
 pub const SCREEN_W: usize = 160;
 pub const SCREEN_H: usize = 144;
@@ -26,7 +27,7 @@ const STAT_VBLANK_INT: u8 = 0x10;
 const STAT_HBLANK_INT: u8 = 0x08;
 const STAT_LYC_EQ: u8 = 0x04;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     HBlank = 0,
     VBlank = 1,
@@ -34,8 +35,11 @@ pub enum Mode {
     Drawing = 3,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Ppu {
+    #[serde(with = "BigArray")]
     pub vram: [u8; 0x2000],
+    #[serde(with = "BigArray")]
     pub oam: [u8; 0xA0],
     pub lcdc: u8,
     pub stat: u8,
@@ -52,6 +56,7 @@ pub struct Ppu {
     dot: u32,
     window_line: u8,
     /// Shade indices 0..=3 per pixel.
+    #[serde(with = "BigArray")]
     pub framebuffer: [u8; SCREEN_W * SCREEN_H],
     /// Set when a full frame has just been completed; caller clears it.
     pub frame_ready: bool,

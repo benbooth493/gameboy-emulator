@@ -1,60 +1,74 @@
 //! Game controller input via `gilrs`. Bluetooth (or USB) pads paired through
-//! the OS appear here as standard gamepads. Read alongside the keyboard: the
-//! frontend ORs the two per button each frame.
+//! the OS appear here as standard gamepads. Bindings are configurable (see
+//! [`crate::config`]); this module resolves them against the live pad and also
+//! captures a raw button press for the rebinding UI.
 
-use gilrs::{Axis, Button, Gilrs};
+use gilrs::{Button as Pad, EventType, Gilrs};
 
-/// Current pressed state of the eight Game Boy buttons from the gamepad.
-#[derive(Default, Clone, Copy)]
-pub struct PadState {
-    pub up: bool,
-    pub down: bool,
-    pub left: bool,
-    pub right: bool,
-    pub a: bool,
-    pub b: bool,
-    pub start: bool,
-    pub select: bool,
-}
+use crate::config::Controls;
+
+/// Current pressed state of the eight Game Boy buttons from the gamepad,
+/// in the [`crate::config::BUTTONS`] order.
+pub type PadState = [bool; 8];
 
 pub struct Gamepad {
     gilrs: Option<Gilrs>,
+    /// Last raw button press seen this frame (for rebinding).
+    captured: Option<Pad>,
+    /// Name of the most recently seen gamepad, for display.
+    name: Option<String>,
 }
 
 impl Gamepad {
     /// Initialise the gamepad subsystem; degrades to no input if unavailable.
     pub fn new() -> Self {
+        let gilrs = Gilrs::new().ok();
+        let name = gilrs
+            .as_ref()
+            .and_then(|g| g.gamepads().next().map(|(_, gp)| gp.name().to_string()));
         Gamepad {
-            gilrs: Gilrs::new().ok(),
+            gilrs,
+            captured: None,
+            name,
         }
     }
 
-    /// Drain pending events and read the first connected pad's current state.
-    /// D-pad and left stick both drive the direction pad; face buttons match
-    /// their labels (South = A, East = B).
-    pub fn poll(&mut self) -> PadState {
+    /// Drain events (updating hotplug state and capturing any raw press), then
+    /// read the first connected pad's state for the configured bindings.
+    pub fn poll(&mut self, controls: &Controls) -> PadState {
+        self.captured = None;
         let Some(gilrs) = self.gilrs.as_mut() else {
-            return PadState::default();
+            return [false; 8];
         };
-        // Pump the event queue so polled state is current and hotplug is seen.
-        while gilrs.next_event().is_some() {}
+        while let Some(ev) = gilrs.next_event() {
+            match ev.event {
+                EventType::ButtonPressed(btn, _) => self.captured = Some(btn),
+                EventType::Connected => {
+                    self.name = Some(gilrs.gamepad(ev.id).name().to_string());
+                }
+                EventType::Disconnected => self.name = None,
+                _ => {}
+            }
+        }
 
         let Some((id, _)) = gilrs.gamepads().next() else {
-            return PadState::default();
+            return [false; 8];
         };
         let gp = gilrs.gamepad(id);
-        let th = 0.5;
-        let x = gp.value(Axis::LeftStickX);
-        let y = gp.value(Axis::LeftStickY);
-        PadState {
-            up: gp.is_pressed(Button::DPadUp) || y > th,
-            down: gp.is_pressed(Button::DPadDown) || y < -th,
-            left: gp.is_pressed(Button::DPadLeft) || x < -th,
-            right: gp.is_pressed(Button::DPadRight) || x > th,
-            a: gp.is_pressed(Button::South),
-            b: gp.is_pressed(Button::East),
-            start: gp.is_pressed(Button::Start),
-            select: gp.is_pressed(Button::Select),
+        let mut state = [false; 8];
+        for (i, s) in state.iter_mut().enumerate() {
+            *s = gp.is_pressed(controls.pads[i]);
         }
+        state
+    }
+
+    /// A gamepad button pressed this frame, for the rebinding UI.
+    pub fn take_captured(&mut self) -> Option<Pad> {
+        self.captured.take()
+    }
+
+    /// The connected controller's name, if any.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 }

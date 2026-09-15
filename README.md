@@ -57,8 +57,12 @@ or start it empty and use **File → Open ROM…** / drag & drop.
 | F5 / F9 | Save / load state |
 
 A **game controller** (Bluetooth or USB, paired through the OS) works too, via
-`gilrs`: D-pad or left stick for direction, South = A, East = B, Start/Select
-mapped through. Keyboard and controller are read together.
+`gilrs`. Keyboard and controller are read together.
+
+All of the above are the **defaults** — every button's keyboard key and
+controller binding is remappable in **Settings → Controls** (click a binding,
+then press the input). Bindings persist to a JSON file in the OS config
+directory.
 
 ## Tests
 

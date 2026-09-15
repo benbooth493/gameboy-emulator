@@ -95,6 +95,10 @@ pub struct Ppu {
     pub framebuffer: [u8; SCREEN_W * SCREEN_H * 4],
     /// Set when a full frame has just been completed; caller clears it.
     pub frame_ready: bool,
+    /// Set on each visible-line HBlank entry; drained by the bus to pace
+    /// HBlank VRAM DMA. Transient, not part of a save state.
+    #[serde(skip)]
+    entered_hblank: bool,
 }
 
 impl Default for Ppu {
@@ -124,6 +128,7 @@ impl Default for Ppu {
             window_line: 0,
             framebuffer: [0; SCREEN_W * SCREEN_H * 4],
             frame_ready: false,
+            entered_hblank: false,
         }
     }
 }
@@ -135,6 +140,11 @@ impl Ppu {
 
     pub fn set_cgb(&mut self, cgb: bool) {
         self.cgb = cgb;
+    }
+
+    /// Return whether a visible-line HBlank just began, clearing the flag.
+    pub fn take_entered_hblank(&mut self) -> bool {
+        std::mem::take(&mut self.entered_hblank)
     }
 
     fn vram_byte(&self, bank: usize, off: usize) -> u8 {
@@ -264,6 +274,7 @@ impl Ppu {
                     if self.dot >= 80 + 172 {
                         self.render_scanline();
                         self.set_mode(Mode::HBlank, ints);
+                        self.entered_hblank = true; // paces HBlank VRAM DMA
                     }
                 }
                 Mode::HBlank => {

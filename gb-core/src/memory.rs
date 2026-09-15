@@ -26,4 +26,7 @@ pub trait CpuBus {
     fn poke(&mut self, addr: u16, val: u8);
     /// Total T-cycles the machine has advanced, for cycle accounting.
     fn elapsed(&self) -> u64;
+    /// The `STOP` instruction executed: perform a CGB speed switch if KEY1 is
+    /// armed. Default is a no-op (DMG / test adapters).
+    fn stop(&mut self) {}
 }

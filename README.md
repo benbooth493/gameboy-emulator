@@ -15,9 +15,9 @@ DMG LCD, and a built-in debugger.
   DMG priority rules, mode timing, STAT/LYC interrupts. Outputs RGBA.
   Verified pixel-perfect against **dmg-acid2** and **cgb-acid2**.
 - **Game Boy Color** — CGB ROMs run in colour: BG/OBJ colour palettes, VRAM
-  banking with tile attributes, WRAM banking, VRAM DMA (HDMA/GDMA). DMG ROMs
-  keep the classic green rendering. (Double-speed switching is not yet
-  implemented — CGB games run at normal speed.)
+  banking with tile attributes, WRAM banking, double-speed mode (KEY1), and
+  VRAM DMA (immediate GDMA + HBlank-paced HDMA). DMG ROMs keep the classic
+  green rendering.
 - **APU** — both pulse channels (with sweep and envelope), wave channel,
   noise channel, frame sequencer; audio output via cpal.
 - **Cartridges** — ROM-only, MBC1, MBC3, MBC5 with banked RAM.

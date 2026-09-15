@@ -21,5 +21,5 @@ pub use cartridge::Cartridge;
 pub use debugger::Debugger;
 pub use gameboy::{GameBoy, StateError};
 pub use joypad::Button;
-pub use memory::Memory;
+pub use memory::CpuBus;
 pub use ppu::{SCREEN_H, SCREEN_W};

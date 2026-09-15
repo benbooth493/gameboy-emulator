@@ -48,15 +48,9 @@ fn blargg_instr_timing() {
     assert!(out.contains("Passed"), "instr_timing did not pass:\n{out}");
 }
 
-// Ignored: mem_timing checks *sub-instruction* memory-access timing (which
-// T-cycle within an instruction a read/write lands on). Our CPU is
-// instruction-atomic — it performs all memory accesses, then ticks the bus for
-// the whole instruction — so it can't reproduce that intra-instruction
-// interleaving without a cycle-accurate rewrite of the CPU/bus loop.
-// cpu_instrs and instr_timing (results + total cycle counts) do pass. Kept as a
-// marker of the known accuracy gap; run with `--ignored` to see it fail.
+// The CPU drives the bus one M-cycle per memory access, so reads/writes land
+// on the correct cycle within an instruction — mem_timing passes.
 #[test]
-#[ignore = "requires cycle-accurate (sub-instruction) memory timing; CPU is instruction-atomic"]
 fn blargg_mem_timing() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test-roms/mem_timing.gb");
     let Ok(rom) = std::fs::read(path) else {

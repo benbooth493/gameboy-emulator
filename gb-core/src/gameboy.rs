@@ -56,11 +56,11 @@ impl GameBoy {
         }
     }
 
-    /// Execute a single instruction and advance all hardware.
+    /// Execute a single instruction. The CPU drives the bus one M-cycle per
+    /// access, so peripherals advance in lock-step during the instruction.
     pub fn step(&mut self) -> u32 {
         self.debugger.record_pc(self.cpu.regs.pc);
         let cycles = self.cpu.step(&mut self.bus);
-        self.bus.tick(cycles);
         self.cycles += cycles as u64;
         cycles
     }

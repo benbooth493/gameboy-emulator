@@ -38,6 +38,8 @@ pub struct Bus {
     /// CGB VRAM DMA source/destination, latched from HDMA1-4.
     hdma_src: u16,
     hdma_dst: u16,
+    /// Total T-cycles the machine has advanced (for CPU cycle accounting).
+    elapsed: u64,
 }
 
 impl Bus {
@@ -64,7 +66,18 @@ impl Bus {
             key1: 0,
             hdma_src: 0,
             hdma_dst: 0,
+            elapsed: 0,
         }
+    }
+
+    /// Advance the whole machine by one CPU M-cycle (4 T-cycles). This is the
+    /// single place peripherals move during instruction execution.
+    fn advance_m(&mut self) {
+        self.timer.tick(4, &mut self.ints);
+        self.ppu.tick(4, &mut self.ints);
+        self.apu.tick(4);
+        self.dma_countdown = self.dma_countdown.saturating_sub(4);
+        self.elapsed += 4;
     }
 
     /// Map a 0xC000-0xDFFF (or echo) address to a flat WRAM index, honouring
@@ -184,14 +197,29 @@ impl Bus {
     }
 }
 
-/// The production adapter for the CPU's [`Memory`](crate::memory::Memory) seam.
-/// Forwards to the inherent routing methods so existing callers stay unchanged.
-impl crate::memory::Memory for Bus {
-    fn read(&self, addr: u16) -> u8 {
+/// The production adapter for the CPU's clocked [`CpuBus`](crate::memory::CpuBus)
+/// seam. Each access advances the machine one M-cycle; the inherent
+/// `read`/`write` (used by tooling and DMA) stay non-clocking.
+impl crate::memory::CpuBus for Bus {
+    fn read(&mut self, addr: u16) -> u8 {
+        self.advance_m();
         Bus::read(self, addr)
     }
     fn write(&mut self, addr: u16, val: u8) {
+        self.advance_m();
         Bus::write(self, addr, val)
+    }
+    fn idle(&mut self) {
+        self.advance_m();
+    }
+    fn peek(&self, addr: u16) -> u8 {
+        Bus::read(self, addr)
+    }
+    fn poke(&mut self, addr: u16, val: u8) {
+        Bus::write(self, addr, val)
+    }
+    fn elapsed(&self) -> u64 {
+        self.elapsed
     }
 }
 

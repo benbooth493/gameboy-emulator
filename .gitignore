@@ -1,4 +1,7 @@
 /target
 test-roms/*.gb
+test-roms/*.gbc
+test-roms/*.png
 *.sav
+*.state
 .serena/

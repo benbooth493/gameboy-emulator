@@ -51,10 +51,21 @@ or start it empty and use **File → Open ROM…** / drag & drop.
 ## Tests
 
 ```sh
-cargo test --workspace            # unit + integration tests
-cargo test --release --test blargg -p gb-core   # hardware test ROMs
+cargo test --workspace                           # unit + integration tests
+cargo test --release --test blargg -p gb-core    # Blargg hardware test ROMs
+cargo test --release --test dmg_acid2 -p gb-core # PPU conformance
 ```
 
-The Blargg tests need `test-roms/cpu_instrs.gb` and
-`test-roms/instr_timing.gb` (from the `retrio/gb-test-roms` mirror); they
-skip gracefully if absent.
+Conformance ROMs live in `test-roms/` (git-ignored) and each test skips
+gracefully if its ROM is absent:
+
+- **Blargg** `cpu_instrs`, `instr_timing`, `mem_timing` (from the
+  `retrio/gb-test-roms` mirror). `cpu_instrs`/`instr_timing` pass.
+  `mem_timing` is `#[ignore]`d: it checks *sub-instruction* memory-access
+  timing, which the instruction-atomic CPU can't reproduce without a
+  cycle-accurate rewrite. Run it with `--ignored` to see the gap.
+- **dmg-acid2** (matt currie) — renders a reference image exercising the
+  background, window, and sprites (flips, priority, 8x16, palettes). The test
+  compares the framebuffer pixel-for-pixel against the checked-in reference
+  (`gb-core/tests/data/dmg-acid2-ref.bin`, decoded from the project's PNG) and
+  **passes exactly**.

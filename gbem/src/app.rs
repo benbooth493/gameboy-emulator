@@ -744,7 +744,11 @@ fn bind_button(label: String, listening: bool) -> egui::Button<'static> {
 }
 
 fn apply_theme(ctx: &egui::Context) {
-    use egui::Color32;
+    use egui::{Color32, Theme, ThemePreference};
+    // Force our dark theme regardless of the OS appearance — otherwise eframe
+    // follows the system theme and only our accent colours would show.
+    ctx.options_mut(|o| o.theme_preference = ThemePreference::Dark);
+
     let mut v = egui::Visuals::dark();
     v.panel_fill = Color32::from_rgb(0x15, 0x18, 0x21);
     v.window_fill = Color32::from_rgb(0x17, 0x1b, 0x26);
@@ -755,12 +759,14 @@ fn apply_theme(ctx: &egui::Context) {
     v.hyperlink_color = ACCENT;
     v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0f32, ACCENT);
     v.widgets.active.bg_stroke = egui::Stroke::new(1.0f32, ACCENT);
-    ctx.set_visuals(v);
+    // Set the *dark theme's* visuals explicitly so they apply even before the
+    // resolved theme settles.
+    ctx.set_visuals_of(Theme::Dark, v);
 
-    let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
-    ctx.set_style(style);
+    ctx.all_styles_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        s.spacing.button_padding = egui::vec2(10.0, 6.0);
+    });
 }
 
 impl eframe::App for EmulatorApp {

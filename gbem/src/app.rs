@@ -1,5 +1,6 @@
-//! The emulator application: game screen, input, audio pump and the
-//! built-in debugger (registers, disassembly, memory, breakpoints, trace).
+//! The emulator application: menu bar, game screen, collapsible sidebar
+//! (debugger / video / controls / audio), a bottom status bar, and a Settings
+//! modal for remappable controls. Clean-studio dark theme with an indigo accent.
 
 use std::path::{Path, PathBuf};
 
@@ -9,21 +10,44 @@ use gb_core::disasm::disassemble;
 use gb_core::{Button, Cartridge, GameBoy, SCREEN_H, SCREEN_W};
 
 use crate::audio::Audio;
+use crate::config::{self, Controls, BUTTONS};
+use crate::gamepad::Gamepad;
 use crate::pacing::{Clock, Pacer, GB_FPS};
 use crate::saves;
 use crate::screen::{ScreenCallback, ScreenRenderer};
 
 /// Flush battery RAM this long after the last write settles.
 const AUTOSAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x7c, 0x83, 0xff);
+
+#[derive(PartialEq, Clone, Copy)]
+enum Tab {
+    Controls,
+    Video,
+    Audio,
+}
+
+/// Which binding is currently being reassigned.
+#[derive(Clone, Copy)]
+enum Rebind {
+    Key(usize),
+    Pad(usize),
+}
 
 pub struct EmulatorApp {
     gb: Option<GameBoy>,
     audio: Audio,
+    gamepad: Gamepad,
+    controls: Controls,
     prev_frame: Vec<u8>,
     cur_frame: Vec<u8>,
-    show_debugger: bool,
+    show_sidebar: bool,
+    settings_open: bool,
+    settings_tab: Tab,
+    rebind: Option<Rebind>,
     ghosting: f32,
     grid: f32,
+    volume: f32,
     mem_addr: String,
     mem_view_base: u16,
     bp_input: String,
@@ -32,27 +56,22 @@ pub struct EmulatorApp {
     disasm_base: u16,
     last_update: Option<std::time::Instant>,
     pacer: Pacer,
-    /// Where to persist battery RAM for the loaded ROM, if it has a battery.
+    // Live emulation speed (emulated frames per real second).
+    fps: u32,
+    fps_count: u32,
+    fps_since: std::time::Instant,
     save_path: Option<PathBuf>,
-    /// Battery RAM has changed since the last flush.
     unsaved_ram: bool,
-    /// When the most recent battery-RAM write happened (for debounced saving).
     last_ram_change: Option<std::time::Instant>,
-    /// Set by the debugger panel's "Save now" button; handled after the panel.
     save_requested: bool,
-    /// Where to read/write the save state for the loaded ROM.
     state_path: Option<PathBuf>,
-    /// Deferred save-state / load-state requests (from keys or panel buttons),
-    /// handled after the UI so they can borrow the whole app.
     state_save_requested: bool,
     state_load_requested: bool,
-    /// Pending result from the async ROM-picker dialog.
-    rom_rx: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
+    rom_rx: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
 }
 
 impl EmulatorApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rom_path: Option<String>) -> Self {
-        // Register the custom wgpu pipeline for the screen.
         let render_state = cc
             .wgpu_render_state
             .as_ref()
@@ -66,24 +85,35 @@ impl EmulatorApp {
                 render_state.target_format,
             ));
 
+        apply_theme(&cc.egui_ctx);
+
         let audio = Audio::new();
         let pacer = Pacer::new(audio.sample_rate);
         let mut app = EmulatorApp {
             gb: None,
             audio,
+            gamepad: Gamepad::new(),
+            controls: Controls::load(),
             pacer,
             prev_frame: vec![0; SCREEN_W * SCREEN_H * 4],
             cur_frame: vec![0; SCREEN_W * SCREEN_H * 4],
-            show_debugger: true,
+            show_sidebar: true,
+            settings_open: false,
+            settings_tab: Tab::Controls,
+            rebind: None,
             ghosting: 0.35,
             grid: 0.6,
+            volume: 0.8,
             mem_addr: "C000".into(),
             mem_view_base: 0xC000,
             bp_input: String::new(),
-            status: "Load a ROM to start (File > Open, or drop a .gb file)".into(),
+            status: "Drop a .gb / .gbc ROM here, or use File → Open ROM…".into(),
             follow_pc: true,
             disasm_base: 0x0100,
             last_update: None,
+            fps: 0,
+            fps_count: 0,
+            fps_since: std::time::Instant::now(),
             save_path: None,
             unsaved_ram: false,
             last_ram_change: None,
@@ -99,6 +129,8 @@ impl EmulatorApp {
         app
     }
 
+    // ---- ROM & persistence (unchanged behaviour) ----
+
     fn load_rom_path(&mut self, path: &Path) {
         match std::fs::read(path) {
             Ok(bytes) => self.load_rom_bytes(bytes, Some(path.to_path_buf())),
@@ -107,17 +139,14 @@ impl EmulatorApp {
     }
 
     fn load_rom_bytes(&mut self, bytes: Vec<u8>, path: Option<PathBuf>) {
-        // Persist the outgoing game before swapping cartridges.
         self.flush_save();
         match Cartridge::from_rom(bytes) {
             Ok(mut cart) => {
                 self.status = format!("Running: {}", cart.title);
-                // Restore battery RAM from a save file, if any.
                 self.save_path = match (&path, cart.has_battery()) {
                     (Some(p), true) => Some(saves::save_path_for(p)),
                     _ => None,
                 };
-                // Save states work for any ROM, battery or not.
                 self.state_path = path.as_deref().map(saves::state_path_for);
                 if let Some(sav) = &self.save_path {
                     if let Some(data) = saves::load(sav) {
@@ -126,7 +155,6 @@ impl EmulatorApp {
                 }
                 self.unsaved_ram = false;
                 self.last_ram_change = None;
-
                 let mut gb = GameBoy::new(cart);
                 gb.bus.apu.set_sample_rate(self.audio.sample_rate);
                 self.gb = Some(gb);
@@ -135,7 +163,6 @@ impl EmulatorApp {
         }
     }
 
-    /// Note battery-RAM changes and flush a save once writes have settled.
     fn autosave_tick(&mut self) {
         let now = std::time::Instant::now();
         let dirty = match self.gb.as_mut() {
@@ -146,12 +173,6 @@ impl EmulatorApp {
             self.unsaved_ram = true;
             self.last_ram_change = Some(now);
         }
-        if std::env::var_os("GBEM_SAVE_DEBUG").is_some() && (dirty || self.unsaved_ram) {
-            eprintln!(
-                "[save] dirty={dirty} unsaved={} save_path={:?}",
-                self.unsaved_ram, self.save_path
-            );
-        }
         if self.unsaved_ram {
             if let Some(t) = self.last_ram_change {
                 if now.duration_since(t) >= AUTOSAVE_DEBOUNCE {
@@ -161,21 +182,18 @@ impl EmulatorApp {
         }
     }
 
-    /// Write battery RAM to disk if there is unsaved data and a save path.
     fn flush_save(&mut self) {
         if !self.unsaved_ram {
             return;
         }
         let Some(path) = self.save_path.clone() else { return };
         let Some(gb) = self.gb.as_ref() else { return };
-        let result = saves::write(&path, gb.bus.cart.ram());
-        match result {
+        match saves::write(&path, gb.bus.cart.ram()) {
             Ok(()) => self.unsaved_ram = false,
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
 
-    /// Write a save state to `<rom>.state`.
     fn save_state_file(&mut self) {
         let Some(path) = self.state_path.clone() else {
             self.status = "Load a ROM from a file to use save states".into();
@@ -184,12 +202,11 @@ impl EmulatorApp {
         let Some(gb) = self.gb.as_ref() else { return };
         let data = gb.save_state();
         match saves::write(&path, &data) {
-            Ok(()) => self.status = format!("Saved state to {}", path.display()),
+            Ok(()) => self.status = "Saved state".into(),
             Err(e) => self.status = format!("Save state failed: {e}"),
         }
     }
 
-    /// Restore a save state from `<rom>.state`.
     fn load_state_file(&mut self) {
         let Some(path) = self.state_path.clone() else { return };
         let Some(data) = saves::load(&path) else {
@@ -203,28 +220,40 @@ impl EmulatorApp {
         }
     }
 
-    /// Explicit "Save now": write battery RAM even if nothing changed.
     fn save_now(&mut self) {
         let Some(path) = self.save_path.clone() else {
             self.status = "This ROM has no battery save".into();
             return;
         };
         let Some(gb) = self.gb.as_ref() else { return };
-        let result = saves::write(&path, gb.bus.cart.ram());
-        match result {
+        match saves::write(&path, gb.bus.cart.ram()) {
             Ok(()) => {
                 self.unsaved_ram = false;
-                self.status = format!("Saved to {}", path.display());
+                self.status = "Saved battery RAM".into();
             }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
 
-    fn handle_input(&mut self, ctx: &egui::Context) {
+    fn open_rom_dialog(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rom_rx = Some(rx);
+        std::thread::spawn(move || {
+            let picked = pollster::block_on(
+                rfd::AsyncFileDialog::new()
+                    .add_filter("Game Boy ROM", &["gb", "gbc", "bin"])
+                    .pick_file(),
+            )
+            .map(|h| h.path().to_path_buf());
+            let _ = tx.send(picked);
+        });
+    }
+
+    // ---- input ----
+
+    fn gameplay_input(&mut self, ctx: &egui::Context, pad: [bool; 8]) {
         let Some(gb) = self.gb.as_mut() else { return };
 
-        // Debug auto-navigation: tap Start until the game reports in-game,
-        // so audio in a real stage can be measured without a windowing setup.
         if std::env::var_os("GBEM_AUTOPLAY").is_some() && gb.bus.read(0xFFE1) != 0 {
             let pressed = (gb.cycles / 70224) % 60 < 5;
             gb.set_button(Button::Start, pressed);
@@ -232,23 +261,9 @@ impl EmulatorApp {
         }
 
         ctx.input(|i| {
-            let map = [
-                (egui::Key::ArrowUp, Button::Up),
-                (egui::Key::ArrowDown, Button::Down),
-                (egui::Key::ArrowLeft, Button::Left),
-                (egui::Key::ArrowRight, Button::Right),
-                (egui::Key::Z, Button::A),
-                (egui::Key::X, Button::B),
-                (egui::Key::Enter, Button::Start),
-                (egui::Key::Backspace, Button::Select),
-            ];
-            for (key, btn) in map {
-                if i.key_pressed(key) {
-                    gb.set_button(btn, true);
-                }
-                if i.key_released(key) {
-                    gb.set_button(btn, false);
-                }
+            for (idx, (_, btn)) in BUTTONS.iter().enumerate() {
+                let held = i.key_down(self.controls.keys[idx]) || pad[idx];
+                gb.set_button(*btn, held);
             }
             if i.key_pressed(egui::Key::P) {
                 gb.toggle_pause();
@@ -256,8 +271,6 @@ impl EmulatorApp {
             if i.key_pressed(egui::Key::N) && gb.is_paused() {
                 gb.step_instruction();
             }
-            // Save state (F5) / load state (F9) — deferred so the handlers can
-            // borrow the whole app after input processing.
             if i.key_pressed(egui::Key::F5) {
                 self.state_save_requested = true;
             }
@@ -267,21 +280,45 @@ impl EmulatorApp {
         });
     }
 
+    /// Capture a fresh key/pad press to complete a rebinding.
+    fn capture_rebind(&mut self, ctx: &egui::Context) {
+        let Some(rebind) = self.rebind else { return };
+        match rebind {
+            Rebind::Key(i) => {
+                let key = ctx.input(|inp| {
+                    inp.events.iter().find_map(|e| match e {
+                        egui::Event::Key { key, pressed: true, .. } => Some(*key),
+                        _ => None,
+                    })
+                });
+                if let Some(k) = key {
+                    if k != egui::Key::Escape {
+                        self.controls.keys[i] = k;
+                        self.controls.save();
+                    }
+                    self.rebind = None;
+                }
+            }
+            Rebind::Pad(i) => {
+                if let Some(b) = self.gamepad.take_captured() {
+                    self.controls.pads[i] = b;
+                    self.controls.save();
+                    self.rebind = None;
+                }
+            }
+        }
+    }
+
+    // ---- emulation ----
+
     fn run_emulation(&mut self) {
         let Some(gb) = self.gb.as_mut() else { return };
         if gb.is_paused() {
             self.last_update = None;
             self.pacer.reset();
-            // Keep the debugger view of the framebuffer fresh while stepping.
             self.cur_frame.copy_from_slice(gb.framebuffer());
             return;
         }
-
-        // Read the clock and let the pacer decide how many frames to run. When
-        // a sound device is open it is the clock — topping the queue up to a
-        // target depth keeps true speed and never drops or gaps samples (a
-        // dropped chunk is audible as broken music in a stage). Otherwise we
-        // fall back to wall-clock time.
         let frames = if self.audio.available {
             self.pacer
                 .frames_due(Clock::Audio { queued_frames: self.audio.queued_frames() })
@@ -300,255 +337,448 @@ impl EmulatorApp {
                 self.status = format!("Stopped: {stop:?}");
                 break;
             }
-            let samples = gb.bus.apu.drain_samples();
+            let mut samples = gb.bus.apu.drain_samples();
             if self.audio.available {
+                if self.volume != 1.0 {
+                    for s in &mut samples {
+                        *s *= self.volume;
+                    }
+                }
                 self.audio.push_samples(&samples);
             }
             self.prev_frame.copy_from_slice(&self.cur_frame);
             self.cur_frame.copy_from_slice(gb.framebuffer());
+            self.fps_count += 1;
+        }
+
+        if self.fps_since.elapsed() >= std::time::Duration::from_secs(1) {
+            self.fps = self.fps_count;
+            self.fps_count = 0;
+            self.fps_since = std::time::Instant::now();
         }
     }
 
+    // ---- screen ----
+
     fn screen_ui(&mut self, ui: &mut egui::Ui) {
         let avail = ui.available_size();
+        if self.gb.is_none() {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("Drop a ROM here\nor  File → Open ROM…")
+                        .size(18.0)
+                        .color(egui::Color32::from_gray(120)),
+                );
+            });
+            return;
+        }
         let aspect = SCREEN_W as f32 / SCREEN_H as f32;
-        let size = if avail.x / avail.y > aspect {
-            egui::vec2(avail.y * aspect, avail.y)
+        // Leave room for the bezel padding.
+        let pad = 14.0;
+        let inner = egui::vec2(avail.x - pad * 2.0, avail.y - pad * 2.0);
+        let size = if inner.x / inner.y > aspect {
+            egui::vec2(inner.y * aspect, inner.y)
         } else {
-            egui::vec2(avail.x, avail.x / aspect)
+            egui::vec2(inner.x, inner.x / aspect)
         };
-        let (rect, _) =
-            ui.allocate_exact_size(size, egui::Sense::focusable_noninteractive());
-        ui.painter().add(egui_wgpu_callback(
-            rect,
-            ScreenCallback {
-                current: self.cur_frame.clone(),
-                previous: self.prev_frame.clone(),
-                ghosting: self.ghosting,
-                grid: self.grid,
-            },
-        ));
+        ui.centered_and_justified(|ui| {
+            egui::Frame::NONE
+                .fill(egui::Color32::from_rgb(0x1b, 0x1f, 0x2b))
+                .inner_margin(egui::Margin::same(pad as i8))
+                .corner_radius(egui::CornerRadius::same(10))
+                .show(ui, |ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(size, egui::Sense::focusable_noninteractive());
+                    ui.painter().add(egui::Shape::Callback(
+                        eframe::egui_wgpu::Callback::new_paint_callback(
+                            rect,
+                            ScreenCallback {
+                                current: self.cur_frame.clone(),
+                                previous: self.prev_frame.clone(),
+                                ghosting: self.ghosting,
+                                grid: self.grid,
+                            },
+                        ),
+                    ));
+                });
+        });
     }
 
-    fn debugger_ui(&mut self, ctx: &egui::Context) {
-        let Some(gb) = self.gb.as_mut() else { return };
+    // ---- sidebar ----
 
-        egui::SidePanel::right("debugger")
-            .default_width(430.0)
+    fn sidebar(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("sidebar")
+            .default_width(300.0)
             .show(ctx, |ui| {
-                ui.heading("Debugger");
-                ui.horizontal(|ui| {
-                    let paused = gb.is_paused();
-                    let label = if paused { "▶ Continue (P)" } else { "⏸ Pause (P)" };
-                    if ui.button(label).clicked() {
-                        gb.toggle_pause();
-                    }
-                    if ui
-                        .add_enabled(paused, egui::Button::new("Step (N)"))
-                        .clicked()
-                    {
-                        gb.step_instruction();
-                    }
-                    if ui
-                        .add_enabled(paused, egui::Button::new("Step frame"))
-                        .clicked()
-                    {
-                        gb.step_frame();
-                    }
-                    if ui
-                        .add_enabled(self.save_path.is_some(), egui::Button::new("💾 Save now"))
-                        .on_hover_text("Write battery RAM to the .sav file")
-                        .clicked()
-                    {
-                        self.save_requested = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    let has_state_path = self.state_path.is_some();
-                    if ui
-                        .add_enabled(has_state_path, egui::Button::new("Save state (F5)"))
-                        .clicked()
-                    {
-                        self.state_save_requested = true;
-                    }
-                    if ui
-                        .add_enabled(has_state_path, egui::Button::new("Load state (F9)"))
-                        .clicked()
-                    {
-                        self.state_load_requested = true;
-                    }
-                });
-                ui.separator();
+                egui::CollapsingHeader::new(egui::RichText::new("Debugger").strong())
+                    .default_open(false)
+                    .show(ui, |ui| self.debugger_section(ui));
 
-                // Registers
-                let r = &gb.cpu.regs;
-                ui.monospace(format!(
-                    "AF {:04X}  BC {:04X}  DE {:04X}  HL {:04X}",
-                    r.af(),
-                    r.bc(),
-                    r.de(),
-                    r.hl()
-                ));
-                ui.monospace(format!(
-                    "PC {:04X}  SP {:04X}  IME {}  cycles {}",
-                    r.pc,
-                    r.sp,
-                    if gb.cpu.ime { "on " } else { "off" },
-                    gb.cycles
-                ));
-                ui.monospace(format!(
-                    "flags [{}{}{}{}]   halted: {}",
-                    if r.flag(FLAG_Z) { 'Z' } else { '-' },
-                    if r.flag(FLAG_N) { 'N' } else { '-' },
-                    if r.flag(FLAG_H) { 'H' } else { '-' },
-                    if r.flag(FLAG_C) { 'C' } else { '-' },
-                    gb.cpu.halted,
-                ));
-                ui.monospace(format!(
-                    "LCDC {:02X}  STAT {:02X}  LY {:3}  IE {:02X}  IF {:02X}",
-                    gb.bus.ppu.lcdc,
-                    gb.bus.ppu.stat,
-                    gb.bus.ppu.ly,
-                    gb.bus.ints.enable,
-                    gb.bus.ints.request
-                ));
-                ui.separator();
-
-                // Disassembly
-                ui.horizontal(|ui| {
-                    ui.label("Disassembly");
-                    ui.checkbox(&mut self.follow_pc, "follow PC");
-                });
-                if self.follow_pc {
-                    self.disasm_base = gb.cpu.regs.pc;
-                }
-                let mut addr = self.disasm_base;
-                egui::ScrollArea::vertical()
-                    .id_salt("disasm")
-                    .max_height(220.0)
+                egui::CollapsingHeader::new(egui::RichText::new("Video").strong())
+                    .default_open(true)
                     .show(ui, |ui| {
-                        for _ in 0..24 {
-                            let (text, len) = disassemble(|a| gb.bus.read(a), addr);
-                            let is_pc = addr == gb.cpu.regs.pc;
-                            let has_bp = gb.has_breakpoint(addr);
-                            let marker = match (has_bp, is_pc) {
-                                (true, true) => "●▶",
-                                (true, false) => "● ",
-                                (false, true) => " ▶",
-                                (false, false) => "  ",
-                            };
-                            let line = format!("{marker} {addr:04X}  {text}");
-                            let resp = ui.selectable_label(
-                                is_pc,
-                                egui::RichText::new(line).monospace().color(if has_bp {
-                                    egui::Color32::from_rgb(230, 80, 80)
-                                } else if is_pc {
-                                    egui::Color32::from_rgb(120, 220, 120)
-                                } else {
-                                    egui::Color32::GRAY
-                                }),
-                            );
-                            if resp.clicked() {
-                                gb.toggle_breakpoint(addr);
+                        ui.add(egui::Slider::new(&mut self.ghosting, 0.0f32..=0.9_f32).text("Ghosting"));
+                        ui.add(egui::Slider::new(&mut self.grid, 0.0f32..=1.0_f32).text("Pixel grid"));
+                    });
+
+                egui::CollapsingHeader::new(egui::RichText::new("Controls").strong())
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(egui::Button::new("Configure…").fill(ACCENT))
+                                .clicked()
+                            {
+                                self.settings_open = true;
+                                self.settings_tab = Tab::Controls;
                             }
-                            addr = addr.wrapping_add(len);
-                        }
+                            if ui.button("Reset").clicked() {
+                                self.controls = Controls::default();
+                                self.controls.save();
+                            }
+                        });
+                        match self.gamepad.name() {
+                            Some(n) => ui.label(format!("🎮 {n}")),
+                            None => ui.label(
+                                egui::RichText::new("No controller")
+                                    .color(egui::Color32::from_gray(120)),
+                            ),
+                        };
                     });
 
-                // Breakpoints
-                ui.horizontal(|ui| {
-                    ui.label("Breakpoint (hex):");
-                    ui.add(egui::TextEdit::singleline(&mut self.bp_input).desired_width(60.0));
-                    if ui.button("Add/Remove").clicked() {
-                        if let Ok(a) = u16::from_str_radix(self.bp_input.trim_start_matches("0x"), 16)
-                        {
-                            gb.toggle_breakpoint(a);
-                        }
-                    }
-                });
-                let bps = gb.breakpoints();
-                if !bps.is_empty() {
-                    let list = bps
-                        .iter()
-                        .map(|b| format!("{b:04X}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    ui.monospace(format!("breakpoints: {list}"));
-                }
-                ui.separator();
-
-                // Memory viewer
-                ui.horizontal(|ui| {
-                    ui.label("Memory @");
-                    let resp =
-                        ui.add(egui::TextEdit::singleline(&mut self.mem_addr).desired_width(60.0));
-                    if resp.lost_focus() || ui.button("Go").clicked() {
-                        if let Ok(a) =
-                            u16::from_str_radix(self.mem_addr.trim_start_matches("0x"), 16)
-                        {
-                            self.mem_view_base = a & 0xFFF0;
-                        }
-                    }
-                });
-                egui::ScrollArea::vertical()
-                    .id_salt("mem")
-                    .max_height(160.0)
+                egui::CollapsingHeader::new(egui::RichText::new("Audio").strong())
+                    .default_open(false)
                     .show(ui, |ui| {
-                        for row in 0..10u16 {
-                            let base = self.mem_view_base.wrapping_add(row * 16);
-                            let bytes: Vec<String> = (0..16)
-                                .map(|i| format!("{:02X}", gb.bus.read(base.wrapping_add(i))))
-                                .collect();
-                            let ascii: String = (0..16)
-                                .map(|i| {
-                                    let b = gb.bus.read(base.wrapping_add(i));
-                                    if b.is_ascii_graphic() { b as char } else { '.' }
-                                })
-                                .collect();
-                            ui.monospace(format!("{base:04X}  {}  {ascii}", bytes.join(" ")));
-                        }
+                        ui.add(egui::Slider::new(&mut self.volume, 0.0f32..=1.0_f32).text("Volume"));
                     });
-                ui.separator();
+            });
+    }
 
-                // Execution trace
-                ui.collapsing("Execution trace (last 16)", |ui| {
-                    let trace = gb.trace();
-                    for pc in trace.iter().rev().take(16) {
-                        let (text, _) = disassemble(|a| gb.bus.read(a), *pc);
-                        ui.monospace(format!("{pc:04X}  {text}"));
+    fn debugger_section(&mut self, ui: &mut egui::Ui) {
+        let Some(gb) = self.gb.as_mut() else {
+            ui.label("No ROM loaded.");
+            return;
+        };
+        ui.horizontal(|ui| {
+            let paused = gb.is_paused();
+            if ui.button(if paused { "▶ Run" } else { "⏸ Pause" }).clicked() {
+                gb.toggle_pause();
+            }
+            if ui.add_enabled(paused, egui::Button::new("Step")).clicked() {
+                gb.step_instruction();
+            }
+            if ui.add_enabled(paused, egui::Button::new("Frame")).clicked() {
+                gb.step_frame();
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.save_path.is_some(), egui::Button::new("💾 Save RAM"))
+                .clicked()
+            {
+                self.save_requested = true;
+            }
+            if ui
+                .add_enabled(self.state_path.is_some(), egui::Button::new("Save state"))
+                .clicked()
+            {
+                self.state_save_requested = true;
+            }
+            if ui
+                .add_enabled(self.state_path.is_some(), egui::Button::new("Load state"))
+                .clicked()
+            {
+                self.state_load_requested = true;
+            }
+        });
+        ui.separator();
+
+        let r = &gb.cpu.regs;
+        ui.monospace(format!(
+            "AF {:04X}  BC {:04X}  DE {:04X}  HL {:04X}",
+            r.af(),
+            r.bc(),
+            r.de(),
+            r.hl()
+        ));
+        ui.monospace(format!(
+            "PC {:04X}  SP {:04X}  IME {}",
+            r.pc,
+            r.sp,
+            if gb.cpu.ime { "on" } else { "off" }
+        ));
+        ui.monospace(format!(
+            "flags [{}{}{}{}]  halted {}",
+            if r.flag(FLAG_Z) { 'Z' } else { '-' },
+            if r.flag(FLAG_N) { 'N' } else { '-' },
+            if r.flag(FLAG_H) { 'H' } else { '-' },
+            if r.flag(FLAG_C) { 'C' } else { '-' },
+            gb.cpu.halted,
+        ));
+        ui.monospace(format!(
+            "LCDC {:02X}  STAT {:02X}  LY {:3}",
+            gb.bus.ppu.lcdc, gb.bus.ppu.stat, gb.bus.ppu.ly
+        ));
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label("Disassembly");
+            ui.checkbox(&mut self.follow_pc, "follow PC");
+        });
+        if self.follow_pc {
+            self.disasm_base = gb.cpu.regs.pc;
+        }
+        let mut addr = self.disasm_base;
+        egui::ScrollArea::vertical()
+            .id_salt("disasm")
+            .max_height(180.0)
+            .show(ui, |ui| {
+                for _ in 0..24 {
+                    let (text, len) = disassemble(|a| gb.bus.read(a), addr);
+                    let is_pc = addr == gb.cpu.regs.pc;
+                    let has_bp = gb.has_breakpoint(addr);
+                    let marker = match (has_bp, is_pc) {
+                        (true, true) => "●▶",
+                        (true, false) => "● ",
+                        (false, true) => " ▶",
+                        (false, false) => "  ",
+                    };
+                    let color = if has_bp {
+                        egui::Color32::from_rgb(230, 80, 80)
+                    } else if is_pc {
+                        ACCENT
+                    } else {
+                        egui::Color32::GRAY
+                    };
+                    if ui
+                        .selectable_label(
+                            is_pc,
+                            egui::RichText::new(format!("{marker} {addr:04X}  {text}"))
+                                .monospace()
+                                .color(color),
+                        )
+                        .clicked()
+                    {
+                        gb.toggle_breakpoint(addr);
+                    }
+                    addr = addr.wrapping_add(len);
+                }
+            });
+
+        ui.horizontal(|ui| {
+            ui.label("Breakpoint");
+            ui.add(egui::TextEdit::singleline(&mut self.bp_input).desired_width(56.0));
+            if ui.button("±").clicked() {
+                if let Ok(a) = u16::from_str_radix(self.bp_input.trim_start_matches("0x"), 16) {
+                    gb.toggle_breakpoint(a);
+                }
+            }
+        });
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label("Memory @");
+            let resp =
+                ui.add(egui::TextEdit::singleline(&mut self.mem_addr).desired_width(56.0));
+            if resp.lost_focus() || ui.button("Go").clicked() {
+                if let Ok(a) = u16::from_str_radix(self.mem_addr.trim_start_matches("0x"), 16) {
+                    self.mem_view_base = a & 0xFFF0;
+                }
+            }
+        });
+        egui::ScrollArea::vertical()
+            .id_salt("mem")
+            .max_height(150.0)
+            .show(ui, |ui| {
+                for row in 0..12u16 {
+                    let base = self.mem_view_base.wrapping_add(row * 16);
+                    let bytes: Vec<String> = (0..16)
+                        .map(|i| format!("{:02X}", gb.bus.read(base.wrapping_add(i))))
+                        .collect();
+                    ui.monospace(format!("{base:04X}  {}", bytes.join(" ")));
+                }
+            });
+    }
+
+    // ---- settings modal ----
+
+    fn settings_modal(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.horizontal(|ui| {
+                ui.heading("Settings");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("Esc to close").color(egui::Color32::from_gray(120)),
+                    );
+                });
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.settings_tab, Tab::Controls, "Controls");
+                ui.selectable_value(&mut self.settings_tab, Tab::Video, "Video");
+                ui.selectable_value(&mut self.settings_tab, Tab::Audio, "Audio");
+            });
+            ui.separator();
+
+            match self.settings_tab {
+                Tab::Controls => self.controls_tab(ui),
+                Tab::Video => {
+                    ui.add(egui::Slider::new(&mut self.ghosting, 0.0f32..=0.9_f32).text("Ghosting"));
+                    ui.add(egui::Slider::new(&mut self.grid, 0.0f32..=1.0_f32).text("Pixel grid"));
+                }
+                Tab::Audio => {
+                    ui.add(egui::Slider::new(&mut self.volume, 0.0f32..=1.0_f32).text("Volume"));
+                }
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Bindings save automatically.")
+                        .color(egui::Color32::from_gray(120)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new("Done").fill(ACCENT)).clicked() {
+                        self.settings_open = false;
+                        self.rebind = None;
+                    }
+                    if self.settings_tab == Tab::Controls && ui.button("Reset to defaults").clicked()
+                    {
+                        self.controls = Controls::default();
+                        self.controls.save();
                     }
                 });
-
-                // Shader controls
-                ui.separator();
-                ui.label("LCD shader");
-                ui.add(egui::Slider::new(&mut self.ghosting, 0.0..=0.9).text("ghosting"));
-                ui.add(egui::Slider::new(&mut self.grid, 0.0..=1.0).text("pixel grid"));
             });
+        });
+        if modal.should_close() {
+            self.settings_open = false;
+            self.rebind = None;
+        }
+    }
+
+    fn controls_tab(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("bindings")
+            .num_columns(3)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Button").color(egui::Color32::from_gray(140)));
+                ui.label(egui::RichText::new("Keyboard").color(egui::Color32::from_gray(140)));
+                ui.label(egui::RichText::new("Controller").color(egui::Color32::from_gray(140)));
+                ui.end_row();
+
+                for (idx, (name, _)) in BUTTONS.iter().enumerate() {
+                    ui.label(egui::RichText::new(*name).strong());
+
+                    let key_listening = matches!(self.rebind, Some(Rebind::Key(i)) if i == idx);
+                    let key_label = if key_listening {
+                        "press a key…".to_string()
+                    } else {
+                        self.controls.keys[idx].name().to_string()
+                    };
+                    if ui
+                        .add(bind_button(key_label, key_listening))
+                        .clicked()
+                    {
+                        self.rebind = Some(Rebind::Key(idx));
+                    }
+
+                    let pad_listening = matches!(self.rebind, Some(Rebind::Pad(i)) if i == idx);
+                    let pad_label = if pad_listening {
+                        "press a button…".to_string()
+                    } else {
+                        config::pad_name(self.controls.pads[idx]).to_string()
+                    };
+                    if ui
+                        .add(bind_button(pad_label, pad_listening))
+                        .clicked()
+                    {
+                        self.rebind = Some(Rebind::Pad(idx));
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+
+    // ---- status bar ----
+
+    fn status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(gb) = self.gb.as_ref() {
+                    let (glyph, col) = if gb.is_paused() {
+                        ("⏸", egui::Color32::from_gray(150))
+                    } else {
+                        ("●", ACCENT)
+                    };
+                    ui.label(egui::RichText::new(glyph).color(col));
+                    ui.label(egui::RichText::new(&gb.bus.cart.title).strong());
+                    ui.separator();
+                    ui.label(if gb.bus.cgb { "CGB" } else { "DMG" });
+                    ui.separator();
+                    ui.label(format!("{} fps", self.fps));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(&self.status).color(egui::Color32::from_gray(150)),
+                    );
+                });
+            });
+        });
     }
 }
 
-fn egui_wgpu_callback(
-    rect: egui::Rect,
-    callback: ScreenCallback,
-) -> egui::Shape {
-    egui::Shape::Callback(eframe::egui_wgpu::Callback::new_paint_callback(
-        rect, callback,
-    ))
+fn bind_button(label: String, listening: bool) -> egui::Button<'static> {
+    let mut text = egui::RichText::new(label).monospace();
+    if listening {
+        text = text.color(ACCENT);
+    }
+    let mut b = egui::Button::new(text).min_size(egui::vec2(120.0, 0.0));
+    if listening {
+        b = b.stroke(egui::Stroke::new(1.5f32, ACCENT));
+    }
+    b
+}
+
+fn apply_theme(ctx: &egui::Context) {
+    use egui::{Color32, Theme, ThemePreference};
+    // Force our dark theme regardless of the OS appearance — otherwise eframe
+    // follows the system theme and only our accent colours would show.
+    ctx.options_mut(|o| o.theme_preference = ThemePreference::Dark);
+
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = Color32::from_rgb(0x15, 0x18, 0x21);
+    v.window_fill = Color32::from_rgb(0x17, 0x1b, 0x26);
+    v.window_stroke = egui::Stroke::new(1.0f32, Color32::from_rgb(0x2a, 0x30, 0x40));
+    v.extreme_bg_color = Color32::from_rgb(0x0e, 0x11, 0x18);
+    v.selection.bg_fill = Color32::from_rgb(0x2e, 0x33, 0x66);
+    v.selection.stroke = egui::Stroke::new(1.0f32, ACCENT);
+    v.hyperlink_color = ACCENT;
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0f32, ACCENT);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0f32, ACCENT);
+    // Set the *dark theme's* visuals explicitly so they apply even before the
+    // resolved theme settles.
+    ctx.set_visuals_of(Theme::Dark, v);
+
+    ctx.all_styles_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        s.spacing.button_padding = egui::vec2(10.0, 6.0);
+    });
 }
 
 impl eframe::App for EmulatorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Async file-picker result.
+        // Async ROM-picker result.
         if let Some(rx) = &self.rom_rx {
             match rx.try_recv() {
                 Ok(Some(path)) => {
                     self.rom_rx = None;
                     self.load_rom_path(&path);
                 }
-                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.rom_rx = None;
-                }
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => self.rom_rx = None,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
@@ -563,67 +793,80 @@ impl eframe::App for EmulatorApp {
             }
         }
 
+        // Poll the gamepad once (also records a captured press for rebinding).
+        let pad = self.gamepad.poll(&self.controls);
+
+        // Menu bar.
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open ROM…").clicked() {
-                        // Never run the modal dialog on the main thread: on
-                        // macOS its nested event loop can stop winit's loop
-                        // and silently quit the app.
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        self.rom_rx = Some(rx);
-                        std::thread::spawn(move || {
-                            let picked = pollster::block_on(
-                                rfd::AsyncFileDialog::new()
-                                    .add_filter("Game Boy ROM", &["gb", "gbc", "bin"])
-                                    .pick_file(),
-                            )
-                            .map(|h| h.path().to_path_buf());
-                            let _ = tx.send(picked);
-                        });
+                        self.open_rom_dialog();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(self.state_path.is_some(), egui::Button::new("Save state (F5)"))
+                        .clicked()
+                    {
+                        self.state_save_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(self.state_path.is_some(), egui::Button::new("Load state (F9)"))
+                        .clicked()
+                    {
+                        self.state_load_requested = true;
                         ui.close();
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut self.show_debugger, "Debugger");
+                    ui.checkbox(&mut self.show_sidebar, "Sidebar");
                 });
-                ui.label(&self.status);
+                if ui.button("Settings").clicked() {
+                    self.settings_open = true;
+                }
             });
         });
 
-        self.handle_input(ctx);
+        // Input (suppressed while the settings modal or a rebind is active).
+        if !self.settings_open && self.rebind.is_none() {
+            self.gameplay_input(ctx, pad);
+        }
         self.run_emulation();
         self.autosave_tick();
 
-        if self.show_debugger {
-            self.debugger_ui(ctx);
+        // Panels.
+        self.status_bar(ctx);
+        if self.show_sidebar {
+            self.sidebar(ctx);
         }
-        if self.save_requested {
-            self.save_requested = false;
-            self.save_now();
-        }
-        if self.state_save_requested {
-            self.state_save_requested = false;
-            self.save_state_file();
-        }
-        if self.state_load_requested {
-            self.state_load_requested = false;
-            self.load_state_file();
-        }
+        self.settings_modal(ctx);
+        self.capture_rebind(ctx);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(egui::Color32::from_rgb(20, 24, 18)))
+            .frame(
+                egui::Frame::NONE.fill(egui::Color32::from_rgb(0x0a, 0x0c, 0x12)),
+            )
             .show(ctx, |ui| {
-                ui.centered_and_justified(|ui| {
-                    self.screen_ui(ui);
-                });
+                self.screen_ui(ui);
             });
+
+        // Deferred actions (borrow the whole app).
+        if std::mem::take(&mut self.save_requested) {
+            self.save_now();
+        }
+        if std::mem::take(&mut self.state_save_requested) {
+            self.save_state_file();
+        }
+        if std::mem::take(&mut self.state_load_requested) {
+            self.load_state_file();
+        }
 
         ctx.request_repaint();
     }
 
     fn on_exit(&mut self) {
-        // Final flush so progress since the last debounced save isn't lost.
         self.flush_save();
     }
 }

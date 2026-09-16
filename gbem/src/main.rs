@@ -1,5 +1,7 @@
 mod app;
 mod audio;
+mod config;
+mod gamepad;
 mod pacing;
 mod saves;
 mod screen;

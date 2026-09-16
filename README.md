@@ -54,6 +54,15 @@ or start it empty and use **File → Open ROM…** / drag & drop.
 | Enter / Backspace | Start / Select |
 | P | Pause/continue |
 | N | Single-step (while paused) |
+| F5 / F9 | Save / load state |
+
+A **game controller** (Bluetooth or USB, paired through the OS) works too, via
+`gilrs`. Keyboard and controller are read together.
+
+All of the above are the **defaults** — every button's keyboard key and
+controller binding is remappable in **Settings → Controls** (click a binding,
+then press the input). Bindings persist to a JSON file in the OS config
+directory.
 
 ## Tests
 
